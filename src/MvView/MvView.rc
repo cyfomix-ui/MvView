@@ -1,0 +1,37 @@
+#include "resource.h"
+#include <windows.h>
+
+IDI_APP ICON "Assets\\MvView.ico"
+
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION MVVIEW_VERSION_MAJOR,MVVIEW_VERSION_MINOR,MVVIEW_VERSION_PATCH,MVVIEW_VERSION_BUILD
+ PRODUCTVERSION MVVIEW_VERSION_MAJOR,MVVIEW_VERSION_MINOR,MVVIEW_VERSION_PATCH,MVVIEW_VERSION_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104b0"
+        BEGIN
+            VALUE "CompanyName", "MvSuite Project\0"
+            VALUE "FileDescription", "MvView Explorer Media Preview\0"
+            VALUE "FileVersion", MVVIEW_VERSION_TEXT "\0"
+            VALUE "InternalName", "MvView.exe\0"
+            VALUE "OriginalFilename", "MvView.exe\0"
+            VALUE "ProductName", "MvView\0"
+            VALUE "ProductVersion", MVVIEW_VERSION_TEXT "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END

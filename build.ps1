@@ -1,0 +1,125 @@
+param(
+    [ValidateSet('Debug','Release')]
+    [string]$Configuration = 'Release',
+    [ValidateSet('x64')]
+    [string]$Platform = 'x64',
+    [string]$PlatformToolset = '',
+    [switch]$Publish
+)
+
+$ErrorActionPreference = 'Stop'
+$Version = '0.20'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$sln = Join-Path $root 'MvView.sln'
+
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path $vswhere)) {
+    throw 'vswhere.exe が見つかりません。Visual Studio または Build Tools の C++ Desktop workload を入れてください。'
+}
+
+$vsInstall = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1
+$msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\Current\Bin\MSBuild.exe' | Select-Object -First 1
+if (-not $msbuild) {
+    throw 'MSBuild.exe が見つかりません。Visual Studio Installer で C++ Desktop workload を確認してください。'
+}
+
+function Get-AvailablePlatformToolsets {
+    param([string]$VsRoot, [string]$PlatformName)
+    $result = New-Object System.Collections.Generic.List[string]
+    if (-not $VsRoot) { return @() }
+    $vcMsbuild = Join-Path $VsRoot 'MSBuild\Microsoft\VC'
+    if (-not (Test-Path $vcMsbuild)) { return @() }
+
+    Get-ChildItem $vcMsbuild -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $toolsetRoot = Join-Path $_.FullName "Platforms\$PlatformName\PlatformToolsets"
+        if (Test-Path $toolsetRoot) {
+            Get-ChildItem $toolsetRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                if (-not $result.Contains($_.Name)) { $result.Add($_.Name) }
+            }
+        }
+    }
+    return $result.ToArray()
+}
+
+function Select-PlatformToolset {
+    param([string[]]$Toolsets)
+    $toolsetArray = @($Toolsets | Where-Object { $_ })
+    if (-not $toolsetArray -or $toolsetArray.Count -eq 0) { return '' }
+
+    # Prefer the newest numeric vNNN toolset available in the installed Visual Studio.
+    # PowerShell treats a single string like an indexable char array, so force @() here.
+    $numeric = @($toolsetArray | Where-Object { $_ -match '^v\d+$' } | Sort-Object { [int]($_.Substring(1)) } -Descending)
+    if ($numeric -and $numeric.Count -gt 0) { return [string]$numeric[0] }
+    $fallback = @($toolsetArray | Sort-Object -Descending)
+    return [string]$fallback[0]
+}
+
+if (-not $PlatformToolset) {
+    $availableToolsets = @(Get-AvailablePlatformToolsets -VsRoot $vsInstall -PlatformName $Platform)
+    $PlatformToolset = Select-PlatformToolset -Toolsets $availableToolsets
+}
+
+Write-Host "MSBuild: $msbuild"
+if ($PlatformToolset -and $PlatformToolset -notmatch '^v\d+$') {
+    throw "PlatformToolset の自動検出結果が不正です: '$PlatformToolset'。手動で .\build.ps1 -Publish -PlatformToolset v180 のように指定してください。"
+}
+
+if ($PlatformToolset) {
+    Write-Host "PlatformToolset: $PlatformToolset"
+}
+
+$msbuildArgs = @(
+    $sln,
+    '/m',
+    '/restore',
+    "/p:Configuration=$Configuration",
+    "/p:Platform=$Platform"
+)
+if ($PlatformToolset) {
+    $msbuildArgs += "/p:PlatformToolset=$PlatformToolset"
+}
+
+& $msbuild @msbuildArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "MSBuild failed. exit=$LASTEXITCODE"
+}
+
+$outDir = Join-Path $root "bin\$Platform\$Configuration"
+$runtimeDir = Join-Path $root 'runtime'
+$runtimeHasMpv = (Test-Path (Join-Path $runtimeDir 'mpv-2.dll')) -or (Test-Path (Join-Path $runtimeDir 'libmpv-2.dll'))
+if ($runtimeHasMpv) {
+    Get-ChildItem $runtimeDir -File | Where-Object { $_.Name -ne 'README.md' } | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $outDir $_.Name) -Force
+    }
+    Write-Host 'runtime フォルダ内の mpv DLL 群を出力フォルダへコピーしました。'
+} else {
+    Write-Warning 'runtime\mpv-2.dll / runtime\libmpv-2.dll がありません。MvView.exe は起動しますが、再生には mpv runtime DLL 群が必要です。'
+}
+
+Write-Host "Output: $outDir"
+
+if ($Publish) {
+    $publishRoot = Join-Path $root 'publish'
+    $publishDir = Join-Path $publishRoot "MvView_v$Version"
+    if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
+
+    Copy-Item (Join-Path $outDir 'MvView.exe') $publishDir -Force
+    if (Test-Path (Join-Path $outDir 'MvView.pdb')) {
+        Copy-Item (Join-Path $outDir 'MvView.pdb') $publishDir -Force
+    }
+    if ($runtimeHasMpv) {
+        $publishRuntime = Join-Path $publishDir 'runtime'
+        New-Item -ItemType Directory -Path $publishRuntime -Force | Out-Null
+        Get-ChildItem $runtimeDir -File | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $publishRuntime $_.Name) -Force
+        }
+    }
+    Copy-Item (Join-Path $root 'README.md') $publishDir -Force
+
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $zipPath = Join-Path $publishRoot "MvView_v$Version`_$stamp.zip"
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $zipPath -Force
+    Write-Host "Publish: $zipPath"
+}

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files"><UniqueIdentifier>{11111111-1111-1111-1111-111111111111}</UniqueIdentifier></Filter>
+    <Filter Include="Header Files"><UniqueIdentifier>{22222222-2222-2222-2222-222222222222}</UniqueIdentifier></Filter>
+    <Filter Include="Resource Files"><UniqueIdentifier>{33333333-3333-3333-3333-333333333333}</UniqueIdentifier></Filter>
+    <Filter Include="Assets"><UniqueIdentifier>{44444444-4444-4444-4444-444444444444}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp"><Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="resource.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="MvView.rc"><Filter>Resource Files</Filter></ResourceCompile>
+    <Manifest Include="app.manifest"><Filter>Resource Files</Filter></Manifest>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Assets\MvView.ico"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewLogo.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewSplash.png"><Filter>Assets</Filter></Image>
+  </ItemGroup>
+</Project>
