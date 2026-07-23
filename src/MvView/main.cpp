@@ -25,6 +25,10 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <shlguid.h>
+#include <servprov.h>
+#include <UIAutomation.h>
+#include <UIAutomationClient.h>
 #include <shlwapi.h>
 #include <exdisp.h>
 #include <shldisp.h>
@@ -38,7 +42,9 @@
 #include <fstream>
 #include <iomanip>
 #include <cstdlib>
+#include <cstdint>
 #include <map>
+#include <optional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -53,6 +59,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uiautomationcore.lib")
 
 #include "resource.h"
 
@@ -69,23 +76,46 @@
 namespace mvview {
 
 constexpr wchar_t kAppName[] = L"MvView";
-constexpr wchar_t kAppVersion[] = L"0.20";
-constexpr wchar_t kAppDisplayName[] = L"MvView v0.20";
+constexpr wchar_t kAppVersion[] = MVVIEW_VERSION_TEXT_W;
+constexpr wchar_t kAppDisplayName[] = MVVIEW_APP_DISPLAY_NAME_W;
 constexpr wchar_t kMainWindowClass[] = L"MvView.MainWindow";
 constexpr wchar_t kPreviewWindowClass[] = L"MvView.PreviewWindow";
 constexpr wchar_t kMpvHostClass[] = L"MvView.MpvHost";
 constexpr wchar_t kSplashWindowClass[] = L"MvView.SplashWindow";
 constexpr wchar_t kSingleInstanceMutex[] = L"Local\\MvView.SingleInstance";
 constexpr UINT WM_TRAYICON = WM_APP + 10;
+constexpr ULONG_PTR MVVIEW_HOVER_COPYDATA_ID = 0x4D564831; // "MVH1"
+constexpr int MVVIEW_HOVER_PROTOCOL_VERSION = 1;
 constexpr UINT WM_MV_HOOK_EVENT = WM_APP + 20;
 constexpr UINT WM_MV_OPEN_PATH = WM_APP + 21;
 constexpr UINT WM_MPV_WAKEUP = WM_APP + 22;
 constexpr UINT WM_MV_SHOW_STATUS = WM_APP + 23;
 constexpr UINT WM_MV_MOUSE_EVENT = WM_APP + 24;
-constexpr UINT TIMER_DEBOUNCE = 1001;
-constexpr UINT TIMER_CURSOR_CLOSE = 1002;
+constexpr UINT WM_MV_MULTI_CONFIRM = WM_APP + 25;
+constexpr UINT TIMER_CURSOR_CLOSE = 1002; // preview progress tick
+constexpr UINT TIMER_HOVER_MONITOR = 1003;
+constexpr UINT TIMER_SELECTION_VALIDATE = 1004;
 constexpr UINT HOTKEY_ESCAPE = 4101;
 constexpr int TRAY_UID = 1;
+
+// Hook callbacks run outside the application message dispatch. Keep them minimal:
+// they only post the event and full 32-bit screen coordinates to this window.
+HWND gHookTargetWindow = nullptr;
+static_assert(sizeof(LPARAM) >= sizeof(std::uint64_t), "MvView hover coordinate transport requires an x64 build.");
+
+LPARAM PackScreenPoint(POINT pt) {
+    const std::uint64_t x = static_cast<std::uint32_t>(pt.x);
+    const std::uint64_t y = static_cast<std::uint32_t>(pt.y);
+    return static_cast<LPARAM>((x << 32) | y);
+}
+
+POINT UnpackScreenPoint(LPARAM packed) {
+    const std::uint64_t value = static_cast<std::uint64_t>(packed);
+    POINT pt{};
+    pt.x = static_cast<LONG>(static_cast<std::int32_t>(value >> 32));
+    pt.y = static_cast<LONG>(static_cast<std::int32_t>(value & 0xffffffffULL));
+    return pt;
+}
 
 constexpr int CMD_TRAY_ENABLED = 2001;
 constexpr int CMD_TRAY_CLOSE_PREVIEW = 2002;
@@ -348,6 +378,200 @@ std::wstring ExtOf(const std::wstring& path) {
 
 enum class MediaKind { None, Image, Video, Audio };
 
+enum class PreviewTrigger {
+    None,
+    HoverSingle,
+    HoverMultiConfirmed,
+    DirectOpen,
+    ExternalHover
+};
+
+enum class HoverState {
+    Idle,
+    WaitingSingle,
+    WaitingMulti,
+    ConfirmingMulti,
+    PlayingSingle,
+    PlayingMulti
+};
+
+enum class PreviewCloseReason {
+    HoverLeft,
+    HoverTargetChanged,
+    SelectionChanged,
+    ForegroundLost,
+    Escape,
+    TrayCommand,
+    Disabled,
+    SettingsChanged,
+    DirectOpenReplaced,
+    ExternalHoverReplaced,
+    Reload,
+    Shutdown
+};
+
+std::wstring PreviewCloseReasonText(PreviewCloseReason reason) {
+    switch (reason) {
+    case PreviewCloseReason::HoverLeft: return L"hover target left";
+    case PreviewCloseReason::HoverTargetChanged: return L"hover target changed";
+    case PreviewCloseReason::SelectionChanged: return L"selection changed";
+    case PreviewCloseReason::ForegroundLost: return L"foreground lost";
+    case PreviewCloseReason::Escape: return L"escape";
+    case PreviewCloseReason::TrayCommand: return L"tray command";
+    case PreviewCloseReason::Disabled: return L"disabled";
+    case PreviewCloseReason::SettingsChanged: return L"settings changed";
+    case PreviewCloseReason::DirectOpenReplaced: return L"direct open replaced current preview";
+    case PreviewCloseReason::ExternalHoverReplaced: return L"external hover replaced current preview";
+    case PreviewCloseReason::Reload: return L"reload";
+    case PreviewCloseReason::Shutdown: return L"shutdown";
+    default: return L"unknown";
+    }
+}
+
+MediaKind DetectMediaKind(const std::wstring& path);
+
+
+struct ExternalHoverRequest {
+    std::wstring action;
+    std::wstring requestId;
+    unsigned long long generation = 0;
+    DWORD sourcePid = 0;
+    std::vector<std::wstring> paths;
+    std::wstring audiblePath;
+    int volumePercent = 0;
+    RECT geometry{ 0, 0, 640, 360 };
+    POINT cursor{ 0, 0 };
+    std::wstring anchorMode;
+};
+
+void SkipJsonSpace(const std::wstring& text, size_t& pos) {
+    while (pos < text.size() && iswspace(text[pos])) ++pos;
+}
+
+bool ParseJsonStringAt(const std::wstring& text, size_t& pos, std::wstring& out) {
+    SkipJsonSpace(text, pos);
+    if (pos >= text.size() || text[pos] != L'"') return false;
+    ++pos;
+    out.clear();
+    while (pos < text.size()) {
+        wchar_t ch = text[pos++];
+        if (ch == L'"') return true;
+        if (ch != L'\\') { out.push_back(ch); continue; }
+        if (pos >= text.size()) return false;
+        wchar_t esc = text[pos++];
+        switch (esc) {
+        case L'"': out.push_back(L'"'); break;
+        case L'\\': out.push_back(L'\\'); break;
+        case L'/': out.push_back(L'/'); break;
+        case L'b': out.push_back(L'\b'); break;
+        case L'f': out.push_back(L'\f'); break;
+        case L'n': out.push_back(L'\n'); break;
+        case L'r': out.push_back(L'\r'); break;
+        case L't': out.push_back(L'\t'); break;
+        case L'u': {
+            if (pos + 4 > text.size()) return false;
+            unsigned value = 0;
+            for (int i = 0; i < 4; ++i) {
+                wchar_t h = text[pos++];
+                value <<= 4;
+                if (h >= L'0' && h <= L'9') value += h - L'0';
+                else if (h >= L'a' && h <= L'f') value += 10 + h - L'a';
+                else if (h >= L'A' && h <= L'F') value += 10 + h - L'A';
+                else return false;
+            }
+            out.push_back(static_cast<wchar_t>(value));
+            break;
+        }
+        default: return false;
+        }
+    }
+    return false;
+}
+
+std::optional<size_t> FindJsonValue(const std::wstring& text, const std::wstring& key) {
+    std::wstring token = L"\"" + key + L"\"";
+    size_t pos = text.find(token);
+    if (pos == std::wstring::npos) return std::nullopt;
+    pos = text.find(L':', pos + token.size());
+    if (pos == std::wstring::npos) return std::nullopt;
+    ++pos;
+    SkipJsonSpace(text, pos);
+    return pos;
+}
+
+bool JsonString(const std::wstring& text, const std::wstring& key, std::wstring& out) {
+    auto found = FindJsonValue(text, key);
+    if (!found) return false;
+    size_t pos = *found;
+    return ParseJsonStringAt(text, pos, out);
+}
+
+bool JsonInt64(const std::wstring& text, const std::wstring& key, long long& out) {
+    auto found = FindJsonValue(text, key);
+    if (!found) return false;
+    size_t pos = *found;
+    bool negative = false;
+    if (pos < text.size() && text[pos] == L'-') { negative = true; ++pos; }
+    if (pos >= text.size() || !iswdigit(text[pos])) return false;
+    unsigned long long value = 0;
+    while (pos < text.size() && iswdigit(text[pos])) {
+        value = value * 10 + static_cast<unsigned>(text[pos++] - L'0');
+        if (value > 0x7fffffffffffffffULL) return false;
+    }
+    out = negative ? -static_cast<long long>(value) : static_cast<long long>(value);
+    return true;
+}
+
+bool JsonStringArray(const std::wstring& text, const std::wstring& key, std::vector<std::wstring>& out) {
+    auto found = FindJsonValue(text, key);
+    if (!found) return false;
+    size_t pos = *found;
+    if (pos >= text.size() || text[pos] != L'[') return false;
+    ++pos;
+    out.clear();
+    while (true) {
+        SkipJsonSpace(text, pos);
+        if (pos >= text.size()) return false;
+        if (text[pos] == L']') return true;
+        std::wstring value;
+        if (!ParseJsonStringAt(text, pos, value)) return false;
+        out.push_back(std::move(value));
+        SkipJsonSpace(text, pos);
+        if (pos < text.size() && text[pos] == L',') { ++pos; continue; }
+        if (pos < text.size() && text[pos] == L']') return true;
+        return false;
+    }
+}
+
+bool ParseExternalHoverJson(const std::wstring& json, ExternalHoverRequest& out, std::wstring& error) {
+    std::wstring protocol;
+    long long version = 0, generation = 0, sourcePid = 0;
+    if (!JsonString(json, L"protocol", protocol) || protocol != L"mvview-hover") { error = L"invalid protocol"; return false; }
+    if (!JsonInt64(json, L"version", version) || version != MVVIEW_HOVER_PROTOCOL_VERSION) { error = L"unsupported version"; return false; }
+    if (!JsonString(json, L"action", out.action)) { error = L"missing action"; return false; }
+    if (out.action != L"hover_open" && out.action != L"hover_close" && out.action != L"hover_move" && out.action != L"hover_update") { error = L"unknown action"; return false; }
+    if (!JsonString(json, L"request_id", out.requestId) || out.requestId.empty()) { error = L"missing request_id"; return false; }
+    if (!JsonInt64(json, L"generation", generation) || generation < 0) { error = L"invalid generation"; return false; }
+    if (!JsonInt64(json, L"source_pid", sourcePid) || sourcePid <= 0 || sourcePid > 0xffffffffLL) { error = L"invalid source_pid"; return false; }
+    out.generation = static_cast<unsigned long long>(generation);
+    out.sourcePid = static_cast<DWORD>(sourcePid);
+    if (out.action == L"hover_close") return true;
+    if (!JsonStringArray(json, L"paths", out.paths) || out.paths.empty()) { error = L"missing paths"; return false; }
+    JsonString(json, L"audible_path", out.audiblePath);
+    JsonString(json, L"anchor_mode", out.anchorMode);
+    long long value = 0;
+    if (JsonInt64(json, L"volume_percent", value)) out.volumePercent = std::clamp<int>(static_cast<int>(value), 0, 100);
+    long long x=0,y=0,w=640,h=360,cx=0,cy=0;
+    JsonInt64(json,L"x",x); JsonInt64(json,L"y",y); JsonInt64(json,L"width",w); JsonInt64(json,L"height",h); JsonInt64(json,L"cursor_x",cx); JsonInt64(json,L"cursor_y",cy);
+    out.geometry = { static_cast<LONG>(x), static_cast<LONG>(y), static_cast<LONG>(x + std::clamp<long long>(w, 160, 8192)), static_cast<LONG>(y + std::clamp<long long>(h, 90, 8192)) };
+    out.cursor = { static_cast<LONG>(cx), static_cast<LONG>(cy) };
+    std::vector<std::wstring> valid;
+    for (const auto& path : out.paths) if (FileExists(path) && DetectMediaKind(path) != MediaKind::None) valid.push_back(path);
+    out.paths.swap(valid);
+    if (out.paths.empty()) { error = L"no valid media paths"; return false; }
+    return true;
+}
+
 MediaKind DetectMediaKind(const std::wstring& path) {
     const std::wstring ext = ExtOf(path);
     static const std::vector<std::wstring> images = { L".jpg", L".jpeg", L".png", L".webp", L".bmp", L".gif", L".tif", L".tiff" };
@@ -385,9 +609,14 @@ std::wstring JsonEscape(const std::wstring& s) {
 
 struct Settings {
     bool enabled = true;
-    int previewDelayMs = 1200;
+    int previewDelayMs = 1200; // legacy compatibility only
+    int hoverPreviewDelayMs = 800;
+    bool hoverPreviewEnabled = true;
+    bool stopImmediatelyOnHoverLeave = true;
+    bool confirmMultipleSelection = true;
+    bool allowPointerOverPreview = true;
     int previewResolutionP = 360;
-    int cursorFarClosePx = 220;
+    int cursorFarClosePx = 220; // retained for backward-compatible settings files
     bool closeWhenForegroundLost = true;
     bool closeWhenSelectionEmpty = true;
     bool closeOnNonMedia = true;
@@ -395,6 +624,10 @@ struct Settings {
     int volumePercent = 50;
     int borderColorIndex = 0;
     bool registerEscapeWhilePreviewVisible = true;
+
+    static bool HasKey(const std::wstring& body, const std::wstring& key) {
+        return body.find(L"\"" + key + L"\"") != std::wstring::npos;
+    }
 
     static int ReadInt(const std::wstring& body, const std::wstring& key, int def) {
         std::wstring needle = L"\"" + key + L"\"";
@@ -426,6 +659,7 @@ struct Settings {
 
     void Clamp() {
         previewDelayMs = std::clamp(previewDelayMs, 0, 5000);
+        hoverPreviewDelayMs = std::clamp(hoverPreviewDelayMs, 0, 5000);
         const int allowed[] = { 720, 480, 360, 240, 180 };
         bool ok = false;
         for (int v : allowed) if (previewResolutionP == v) ok = true;
@@ -445,13 +679,13 @@ struct Settings {
 
     COLORREF BorderColor() const {
         switch (borderColorIndex) {
-        case 1: return RGB(96, 238, 255);   // aqua
-        case 2: return RGB(126, 255, 126);  // green
-        case 3: return RGB(255, 170, 72);   // orange
-        case 4: return RGB(255, 128, 196);  // pink
-        case 5: return RGB(235, 235, 235);  // white
-        case 6: return RGB(160, 140, 255);  // purple
-        default: return RGB(255, 232, 92);  // yellow
+        case 1: return RGB(96, 238, 255);
+        case 2: return RGB(126, 255, 126);
+        case 3: return RGB(255, 170, 72);
+        case 4: return RGB(255, 128, 196);
+        case 5: return RGB(235, 235, 235);
+        case 6: return RGB(160, 140, 255);
+        default: return RGB(255, 232, 92);
         }
     }
 
@@ -464,6 +698,16 @@ struct Settings {
         std::wstring body = ss.str();
         enabled = ReadBool(body, L"enabled", enabled);
         previewDelayMs = ReadInt(body, L"previewDelayMs", previewDelayMs);
+        if (HasKey(body, L"hoverPreviewDelayMs")) {
+            hoverPreviewDelayMs = ReadInt(body, L"hoverPreviewDelayMs", hoverPreviewDelayMs);
+        } else if (HasKey(body, L"previewDelayMs")) {
+            hoverPreviewDelayMs = previewDelayMs;
+            Log(L"Settings: migrated previewDelayMs to hoverPreviewDelayMs");
+        }
+        hoverPreviewEnabled = ReadBool(body, L"hoverPreviewEnabled", hoverPreviewEnabled);
+        stopImmediatelyOnHoverLeave = ReadBool(body, L"stopImmediatelyOnHoverLeave", stopImmediatelyOnHoverLeave);
+        confirmMultipleSelection = ReadBool(body, L"confirmMultipleSelection", confirmMultipleSelection);
+        allowPointerOverPreview = ReadBool(body, L"allowPointerOverPreview", allowPointerOverPreview);
         previewResolutionP = ReadInt(body, L"previewResolutionP", previewResolutionP);
         if (previewResolutionP == 360) {
             int oldHeight = ReadInt(body, L"maxPreviewHeight", 0);
@@ -478,6 +722,7 @@ struct Settings {
         borderColorIndex = ReadInt(body, L"borderColorIndex", borderColorIndex);
         registerEscapeWhilePreviewVisible = ReadBool(body, L"registerEscapeWhilePreviewVisible", registerEscapeWhilePreviewVisible);
         Clamp();
+        Save(); // persist migrated/new keys once
     }
 
     void Save() const {
@@ -487,7 +732,12 @@ struct Settings {
         if (!fs) return;
         fs << L"{\n";
         fs << L"  \"enabled\": " << (enabled ? L"true" : L"false") << L",\n";
-        fs << L"  \"previewDelayMs\": " << previewDelayMs << L",\n";
+        fs << L"  \"hoverPreviewEnabled\": " << (hoverPreviewEnabled ? L"true" : L"false") << L",\n";
+        fs << L"  \"hoverPreviewDelayMs\": " << hoverPreviewDelayMs << L",\n";
+        fs << L"  \"previewDelayMs\": " << hoverPreviewDelayMs << L",\n";
+        fs << L"  \"stopImmediatelyOnHoverLeave\": " << (stopImmediatelyOnHoverLeave ? L"true" : L"false") << L",\n";
+        fs << L"  \"confirmMultipleSelection\": " << (confirmMultipleSelection ? L"true" : L"false") << L",\n";
+        fs << L"  \"allowPointerOverPreview\": " << (allowPointerOverPreview ? L"true" : L"false") << L",\n";
         fs << L"  \"previewResolutionP\": " << previewResolutionP << L",\n";
         fs << L"  \"cursorFarClosePx\": " << cursorFarClosePx << L",\n";
         fs << L"  \"closeWhenForegroundLost\": " << (closeWhenForegroundLost ? L"true" : L"false") << L",\n";
@@ -500,6 +750,7 @@ struct Settings {
         fs << L"}\n";
     }
 };
+
 template <class T>
 struct ComPtr {
     T* p = nullptr;
@@ -507,6 +758,17 @@ struct ComPtr {
     ~ComPtr() { reset(); }
     ComPtr(const ComPtr&) = delete;
     ComPtr& operator=(const ComPtr&) = delete;
+    ComPtr(ComPtr&& other) noexcept : p(other.p) { other.p = nullptr; }
+    ComPtr& operator=(ComPtr&& other) noexcept {
+        // ComPtr defines operator&() for COM out-parameters, so using &other
+        // here would return T** instead of the actual ComPtr address.
+        if (this != std::addressof(other)) {
+            reset();
+            p = other.p;
+            other.p = nullptr;
+        }
+        return *this;
+    }
     T** operator&() { reset(); return &p; }
     T* operator->() const { return p; }
     operator bool() const { return p != nullptr; }
@@ -514,7 +776,47 @@ struct ComPtr {
     void reset(T* v = nullptr) { if (p) p->Release(); p = v; }
 };
 
+struct ShellViewContext {
+    long candidateIndex = -1;
+    HWND explorerRoot = nullptr;
+    HWND viewHwnd = nullptr;
+    std::wstring locationName;
+    std::wstring locationUrl;
+    std::wstring tabKey;
+    int score = 0;
+    ComPtr<IShellView> shellView;
+    ComPtr<IFolderView2> folderView;
+};
+
+struct HoverTarget {
+    std::wstring path;
+    std::wstring key;
+    std::wstring displayName;
+    RECT itemRect{};
+    HWND explorerRoot = nullptr;
+    HWND viewHwnd = nullptr;
+    std::wstring tabKey;
+    MediaKind kind = MediaKind::None;
+
+    bool IsValid() const {
+        return !path.empty() && kind != MediaKind::None && explorerRoot != nullptr;
+    }
+};
+
 class ExplorerReader {
+    struct CachedShellItem {
+        std::vector<std::wstring> normalizedNames;
+        std::wstring path;
+    };
+
+    ComPtr<IUIAutomation> automation_;
+    std::wstring lastLoggedTabKey_;
+    std::wstring lastFailure_;
+    ULONGLONG lastFailureTick_ = 0;
+    std::wstring itemCacheTabKey_;
+    ULONGLONG itemCacheTick_ = 0;
+    std::vector<CachedShellItem> itemCache_;
+
 public:
     bool IsExplorerWindow(HWND hwnd) const {
         HWND root = GetAncestor(hwnd, GA_ROOT);
@@ -524,34 +826,171 @@ public:
         return c == L"CabinetWClass" || c == L"ExploreWClass";
     }
 
-    std::vector<std::wstring> GetSelectedPathsForForeground(HWND foreground, std::wstring* focusedPath = nullptr) {
-        std::vector<std::wstring> result;
-        if (focusedPath) focusedPath->clear();
-        if (!foreground || !IsExplorerWindow(foreground)) return result;
+    bool ResolveHoveredItem(HWND foreground, POINT screenPoint, HoverTarget& target) {
+        target = {};
+        if (!foreground || !IsExplorerWindow(foreground)) return false;
         HWND root = GetAncestor(foreground, GA_ROOT);
-        const std::wstring activeTitle = WindowTextOf(root);
-        Log(L"ExplorerReader: foreground title=" + activeTitle);
+        HWND pointWindow = WindowFromPoint(screenPoint);
+        if (!pointWindow || GetAncestor(pointWindow, GA_ROOT) != root) return false;
+        if (!PointIsInShellFileView(pointWindow, root)) return false;
 
-        struct Candidate {
-            long index = -1;
-            HWND hwnd = nullptr;
-            std::wstring locationName;
-            std::wstring locationUrl;
-            std::wstring focused;
-            std::vector<std::wstring> selected;
-            int score = 0;
-        };
-        std::vector<Candidate> candidates;
+        ShellViewContext context;
+        if (!ResolveActiveTab(foreground, &screenPoint, context, false)) {
+            LogResolutionFailure(L"Shell active tab could not be resolved");
+            return false;
+        }
+        if (context.viewHwnd && pointWindow != context.viewHwnd && !IsChild(context.viewHwnd, pointWindow)) {
+            LogResolutionFailure(L"Pointer is not inside the active Shell View");
+            return false;
+        }
+
+        ComPtr<IUIAutomationElement> itemElement;
+        std::wstring displayName;
+        RECT itemRect{};
+        if (!ResolveUiaItem(screenPoint, root, itemElement, displayName, itemRect)) return false;
+
+        std::wstring path;
+        if (!MapDisplayNameToUniqueShellItem(context, displayName, path)) return false;
+        MediaKind kind = DetectMediaKind(path);
+        if (kind == MediaKind::None || !FileExists(path)) return false;
+
+        target.path = path;
+        target.key = ToLower(path);
+        target.displayName = displayName;
+        target.itemRect = itemRect;
+        target.explorerRoot = root;
+        target.viewHwnd = context.viewHwnd;
+        target.tabKey = context.tabKey;
+        target.kind = kind;
+        return true;
+    }
+
+    std::vector<std::wstring> GetSelectedPathsForForeground(
+        HWND foreground,
+        std::wstring* tabKey = nullptr,
+        HWND* explorerRoot = nullptr,
+        bool forceCandidateLog = false) {
+        std::vector<std::wstring> result;
+        if (tabKey) tabKey->clear();
+        if (explorerRoot) *explorerRoot = nullptr;
+        if (!foreground || !IsExplorerWindow(foreground)) return result;
+
+        ShellViewContext context;
+        if (!ResolveActiveTab(foreground, nullptr, context, forceCandidateLog)) return result;
+        if (tabKey) *tabKey = context.tabKey;
+        if (explorerRoot) *explorerRoot = context.explorerRoot;
+        return GetPathsFromView(context, SVGIO_SELECTION);
+    }
+
+private:
+    bool EnsureAutomation() {
+        if (automation_) return true;
+        HRESULT hr = CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation_.p));
+        if (FAILED(hr) || !automation_) {
+            hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&automation_.p));
+        }
+        if (FAILED(hr) || !automation_) {
+            LogResolutionFailure(L"UI Automation initialization failed: HRESULT=" + std::to_wstring((long)hr));
+            return false;
+        }
+        Log(L"ExplorerReader: UI Automation initialized");
+        return true;
+    }
+
+    void LogResolutionFailure(const std::wstring& text) {
+        ULONGLONG now = GetTickCount64();
+        if (text != lastFailure_ || now - lastFailureTick_ >= 2000) {
+            lastFailure_ = text;
+            lastFailureTick_ = now;
+            Log(L"Explorer hover resolve failed: " + text);
+        }
+    }
+
+    static bool PointIsInShellFileView(HWND pointWindow, HWND root) {
+        bool shellDefViewFound = false;
+        for (HWND current = pointWindow; current; current = GetParent(current)) {
+            wchar_t cls[256]{};
+            GetClassNameW(current, cls, 256);
+            if (wcscmp(cls, L"SHELLDLL_DefView") == 0) shellDefViewFound = true;
+            if (current == root) break;
+        }
+        return shellDefViewFound;
+    }
+
+    bool ResolveUiaItem(
+        POINT screenPoint,
+        HWND explorerRoot,
+        ComPtr<IUIAutomationElement>& itemElement,
+        std::wstring& displayName,
+        RECT& itemRect) {
+        if (!EnsureAutomation()) return false;
+        ComPtr<IUIAutomationElement> current;
+        HRESULT hr = automation_->ElementFromPoint(screenPoint, &current.p);
+        if (FAILED(hr) || !current) {
+            LogResolutionFailure(L"UI Automation ElementFromPoint failed");
+            return false;
+        }
+
+        ComPtr<IUIAutomationTreeWalker> walker;
+        if (FAILED(automation_->get_ControlViewWalker(&walker.p)) || !walker) {
+            LogResolutionFailure(L"UI Automation ControlViewWalker unavailable");
+            return false;
+        }
+
+        for (int depth = 0; depth < 14 && current; ++depth) {
+            CONTROLTYPEID controlType = 0;
+            current->get_CurrentControlType(&controlType);
+            if (controlType == UIA_TreeItemControlTypeId) return false;
+            if (controlType == UIA_DataItemControlTypeId || controlType == UIA_ListItemControlTypeId) {
+                RECT bounds{};
+                if (FAILED(current->get_CurrentBoundingRectangle(&bounds)) || IsRectEmpty(&bounds) || !::PtInRect(&bounds, screenPoint)) {
+                    LogResolutionFailure(L"UI Automation item has invalid bounds");
+                    return false;
+                }
+                BSTR name = nullptr;
+                if (FAILED(current->get_CurrentName(&name)) || !name) {
+                    LogResolutionFailure(L"UI Automation item name unavailable");
+                    return false;
+                }
+                displayName = Trim(name);
+                SysFreeString(name);
+                if (displayName.empty()) return false;
+
+                UIA_HWND nativeHwnd = 0;
+                current->get_CurrentNativeWindowHandle(&nativeHwnd);
+                if (nativeHwnd && GetAncestor(reinterpret_cast<HWND>((INT_PTR)nativeHwnd), GA_ROOT) != explorerRoot) return false;
+                itemRect = bounds;
+                itemElement.reset(current.p);
+                current.p = nullptr;
+                return true;
+            }
+
+            ComPtr<IUIAutomationElement> parent;
+            if (FAILED(walker->GetParentElement(current.get(), &parent.p)) || !parent) break;
+            current.reset(parent.p);
+            parent.p = nullptr;
+        }
+        return false;
+    }
+
+    bool ResolveActiveTab(HWND foreground, const POINT* screenPoint, ShellViewContext& out, bool forceLog) {
+        out = ShellViewContext{};
+        HWND root = GetAncestor(foreground, GA_ROOT);
+        if (!root || !IsExplorerWindow(root)) return false;
+        const std::wstring activeTitle = WindowTextOf(root);
+        HWND pointWindow = screenPoint ? WindowFromPoint(*screenPoint) : nullptr;
 
         ComPtr<IShellWindows> shellWindows;
         HRESULT hr = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&shellWindows.p));
         if (FAILED(hr) || !shellWindows) {
-            Log(L"ExplorerReader: CoCreateInstance(IShellWindows) failed");
-            return result;
+            LogResolutionFailure(L"CoCreateInstance(IShellWindows) failed");
+            return false;
         }
 
         long count = 0;
         shellWindows->get_Count(&count);
+        std::vector<std::wstring> candidateLogs;
+        bool found = false;
         for (long i = 0; i < count; ++i) {
             VARIANT index{};
             VariantInit(&index);
@@ -565,92 +1004,172 @@ public:
             SHANDLE_PTR webHwnd = 0;
             if (FAILED(web->get_HWND(&webHwnd))) continue;
             HWND webRoot = GetAncestor((HWND)webHwnd, GA_ROOT);
-            if (webRoot != root && (HWND)webHwnd != root && (HWND)webHwnd != foreground) continue;
+            if (webRoot != root && (HWND)webHwnd != root) continue;
 
-            Candidate cand;
-            cand.index = i;
-            cand.hwnd = (HWND)webHwnd;
-
-            BSTR bLocationName = nullptr;
-            if (SUCCEEDED(web->get_LocationName(&bLocationName)) && bLocationName) {
-                cand.locationName = Trim(bLocationName);
-                SysFreeString(bLocationName);
+            ShellViewContext candidate;
+            candidate.candidateIndex = i;
+            candidate.explorerRoot = root;
+            BSTR value = nullptr;
+            if (SUCCEEDED(web->get_LocationName(&value)) && value) {
+                candidate.locationName = Trim(value);
+                SysFreeString(value);
             }
-            BSTR bLocationUrl = nullptr;
-            if (SUCCEEDED(web->get_LocationURL(&bLocationUrl)) && bLocationUrl) {
-                cand.locationUrl = Trim(bLocationUrl);
-                SysFreeString(bLocationUrl);
+            value = nullptr;
+            if (SUCCEEDED(web->get_LocationURL(&value)) && value) {
+                candidate.locationUrl = Trim(value);
+                SysFreeString(value);
             }
 
-            ComPtr<IDispatch> doc;
-            if (FAILED(web->get_Document(&doc.p)) || !doc) continue;
-            ComPtr<IShellFolderViewDual> view;
-            if (FAILED(doc->QueryInterface(IID_PPV_ARGS(&view.p))) || !view) continue;
+            ComPtr<::IServiceProvider> provider;
+            if (FAILED(web->QueryInterface(IID_PPV_ARGS(&provider.p))) || !provider) continue;
+            ComPtr<IShellBrowser> browser;
+            if (FAILED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser.p))) || !browser) continue;
+            if (FAILED(browser->QueryActiveShellView(&candidate.shellView.p)) || !candidate.shellView) continue;
+            candidate.shellView->GetWindow(&candidate.viewHwnd);
+            if (FAILED(candidate.shellView->QueryInterface(IID_PPV_ARGS(&candidate.folderView.p))) || !candidate.folderView) continue;
 
-            // Keep FocusedItem only as diagnostic information.  Windows 11 Explorer
-            // tabs can keep FocusedItem on an old tab, so it must not decide the
-            // preview target.
-            ComPtr<FolderItem> focusedItem;
-            if (SUCCEEDED(view->get_FocusedItem(&focusedItem.p)) && focusedItem) {
-                BSTR fpath = nullptr;
-                if (SUCCEEDED(focusedItem->get_Path(&fpath)) && fpath) {
-                    cand.focused = Trim(fpath);
-                    SysFreeString(fpath);
+            if (candidate.viewHwnd && IsWindowVisible(candidate.viewHwnd)) candidate.score += 5000;
+            if (screenPoint && pointWindow && candidate.viewHwnd &&
+                (pointWindow == candidate.viewHwnd || IsChild(candidate.viewHwnd, pointWindow))) candidate.score += 4000;
+            if (!candidate.locationName.empty() && ContainsInsensitive(activeTitle, candidate.locationName)) candidate.score += 1000;
+            if (!candidate.locationUrl.empty() && ContainsInsensitive(activeTitle, candidate.locationUrl)) candidate.score += 300;
+
+            candidate.tabKey = ToLower(candidate.locationUrl) + L"|" +
+                std::to_wstring((uintptr_t)candidate.viewHwnd) + L"|" + std::to_wstring(candidate.candidateIndex);
+            candidateLogs.push_back(L"candidate[" + std::to_wstring(i) + L"] location=" + candidate.locationName +
+                L" view=" + std::to_wstring((uintptr_t)candidate.viewHwnd) +
+                L" visible=" + (candidate.viewHwnd && IsWindowVisible(candidate.viewHwnd) ? L"true" : L"false") +
+                L" score=" + std::to_wstring(candidate.score));
+
+            if (!found || candidate.score > out.score) {
+                out = std::move(candidate);
+                found = true;
+            }
+        }
+
+        if (!found) {
+            LogResolutionFailure(L"No Explorer Shell View candidate matched the foreground tab");
+            return false;
+        }
+        if (forceLog || out.tabKey != lastLoggedTabKey_) {
+            Log(L"ExplorerReader: foreground title=" + activeTitle);
+            for (const auto& line : candidateLogs) Log(L"ExplorerReader: " + line);
+            Log(L"ExplorerReader: active tab candidate=" + std::to_wstring(out.candidateIndex) +
+                L" tabKey=" + out.tabKey);
+            lastLoggedTabKey_ = out.tabKey;
+        }
+        return true;
+    }
+
+    std::vector<std::wstring> GetPathsFromView(const ShellViewContext& context, UINT flags) {
+        std::vector<std::wstring> paths;
+        if (!context.folderView) return paths;
+        ComPtr<IShellItemArray> items;
+        if (FAILED(context.folderView->Items(flags, IID_PPV_ARGS(&items.p))) || !items) return paths;
+        DWORD count = 0;
+        if (FAILED(items->GetCount(&count))) return paths;
+        for (DWORD i = 0; i < count; ++i) {
+            ComPtr<IShellItem> item;
+            if (FAILED(items->GetItemAt(i, &item.p)) || !item) continue;
+            PWSTR rawPath = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) && rawPath) {
+                std::wstring path = Trim(rawPath);
+                CoTaskMemFree(rawPath);
+                if (!path.empty() && FileExists(path)) paths.push_back(path);
+            }
+        }
+        return paths;
+    }
+
+    static void AddDisplayName(IShellItem* item, SIGDN sigdn, std::vector<std::wstring>& names) {
+        if (!item) return;
+        PWSTR raw = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(sigdn, &raw)) && raw) {
+            std::wstring name = Trim(raw);
+            CoTaskMemFree(raw);
+            if (!name.empty()) names.push_back(name);
+        }
+    }
+
+    bool RebuildItemCache(const ShellViewContext& context) {
+        const bool tabChanged = itemCacheTabKey_ != context.tabKey;
+        itemCache_.clear();
+        itemCacheTabKey_ = context.tabKey;
+        itemCacheTick_ = GetTickCount64();
+        if (!context.folderView) return false;
+
+        ComPtr<IShellItemArray> items;
+        if (FAILED(context.folderView->Items(SVGIO_ALLVIEW, IID_PPV_ARGS(&items.p))) || !items) {
+            LogResolutionFailure(L"IFolderView2::Items(SVGIO_ALLVIEW) failed");
+            return false;
+        }
+        DWORD count = 0;
+        if (FAILED(items->GetCount(&count))) return false;
+        itemCache_.reserve(count);
+        for (DWORD i = 0; i < count; ++i) {
+            ComPtr<IShellItem> item;
+            if (FAILED(items->GetItemAt(i, &item.p)) || !item) continue;
+
+            PWSTR rawPath = nullptr;
+            if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath)) || !rawPath) continue;
+            std::wstring candidatePath = Trim(rawPath);
+            CoTaskMemFree(rawPath);
+            if (candidatePath.empty() || !FileExists(candidatePath)) continue;
+
+            std::vector<std::wstring> displayNames;
+            AddDisplayName(item.get(), SIGDN_NORMALDISPLAY, displayNames);
+            AddDisplayName(item.get(), SIGDN_PARENTRELATIVEEDITING, displayNames);
+            AddDisplayName(item.get(), SIGDN_PARENTRELATIVEPARSING, displayNames);
+            CachedShellItem cached;
+            cached.path = std::move(candidatePath);
+            for (const auto& display : displayNames) {
+                std::wstring normalized = ToLower(Trim(display));
+                if (!normalized.empty() &&
+                    std::find(cached.normalizedNames.begin(), cached.normalizedNames.end(), normalized) == cached.normalizedNames.end()) {
+                    cached.normalizedNames.push_back(std::move(normalized));
                 }
             }
+            if (!cached.normalizedNames.empty()) itemCache_.push_back(std::move(cached));
+        }
+        if (tabChanged) {
+            Log(L"ExplorerReader: Shell item cache rebuilt: tab=" + context.tabKey +
+                L" count=" + std::to_wstring(itemCache_.size()));
+        }
+        return true;
+    }
 
-            ComPtr<FolderItems> items;
-            if (FAILED(view->SelectedItems(&items.p)) || !items) continue;
-            long selectedCount = 0;
-            items->get_Count(&selectedCount);
-            for (long j = 0; j < selectedCount; ++j) {
-                VARIANT itemIndex{};
-                VariantInit(&itemIndex);
-                itemIndex.vt = VT_I4;
-                itemIndex.lVal = j;
-                ComPtr<FolderItem> item;
-                if (FAILED(items->Item(itemIndex, &item.p)) || !item) continue;
-                BSTR bpath = nullptr;
-                if (SUCCEEDED(item->get_Path(&bpath)) && bpath) {
-                    std::wstring path = Trim(bpath);
-                    SysFreeString(bpath);
-                    if (!path.empty()) cand.selected.push_back(path);
-                }
-            }
-
-            if (!cand.selected.empty()) cand.score += 100;
-            if (!cand.locationName.empty() && ContainsInsensitive(activeTitle, cand.locationName)) cand.score += 1000;
-            if (!cand.locationUrl.empty() && ContainsInsensitive(activeTitle, cand.locationUrl)) cand.score += 300;
-            // Prefer candidates with more selected items when the active tab title is
-            // not enough to distinguish entries.
-            cand.score += static_cast<int>(std::min<size_t>(cand.selected.size(), 20));
-
-            Log(L"ExplorerReader: candidate[" + std::to_wstring(cand.index) +
-                L"] locationName=" + cand.locationName +
-                L" selected=" + std::to_wstring(cand.selected.size()) +
-                L" score=" + std::to_wstring(cand.score) +
-                (cand.focused.empty() ? L"" : (L" focused=" + cand.focused)));
-            candidates.push_back(std::move(cand));
+    bool MapDisplayNameToUniqueShellItem(
+        const ShellViewContext& context,
+        const std::wstring& uiaName,
+        std::wstring& path) {
+        path.clear();
+        const ULONGLONG now = GetTickCount64();
+        if (itemCacheTabKey_ != context.tabKey || itemCache_.empty() || now - itemCacheTick_ >= 2000) {
+            if (!RebuildItemCache(context)) return false;
         }
 
-        const Candidate* best = nullptr;
-        for (const auto& cand : candidates) {
-            if (cand.selected.empty()) continue;
-            if (!best || cand.score > best->score) best = &cand;
+        const std::wstring wanted = ToLower(Trim(uiaName));
+        std::vector<std::wstring> matches;
+        for (const auto& item : itemCache_) {
+            if (std::find(item.normalizedNames.begin(), item.normalizedNames.end(), wanted) != item.normalizedNames.end())
+                matches.push_back(item.path);
         }
-        if (!best) {
-            Log(L"ExplorerReader: selected items returned=0");
-            return result;
+        std::sort(matches.begin(), matches.end(), [](const std::wstring& a, const std::wstring& b) {
+            return ToLower(a) < ToLower(b);
+        });
+        matches.erase(std::unique(matches.begin(), matches.end(), [](const std::wstring& a, const std::wstring& b) {
+            return ToLower(a) == ToLower(b);
+        }), matches.end());
+        if (matches.size() != 1) {
+            LogResolutionFailure(L"Shell item mapping was not unique for UIA name '" + uiaName +
+                L"' (matches=" + std::to_wstring(matches.size()) + L")");
+            return false;
         }
-
-        result = best->selected;
-        if (focusedPath) *focusedPath = best->focused;
-        Log(L"ExplorerReader: active candidate index=" + std::to_wstring(best->index) +
-            L" locationName=" + best->locationName +
-            L" selected items returned=" + std::to_wstring(result.size()));
-        return result;
+        path = matches[0];
+        return true;
     }
 };
+
 
 class MpvApi {
 public:
@@ -913,6 +1432,26 @@ bool PointInRect(const RECT& rc, POINT pt) {
     return pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
 }
 
+bool PointInTransferBridge(const RECT& from, const RECT& to, POINT pt, LONG margin = 8) {
+    RECT bridge{};
+    if (from.right <= to.left || to.right <= from.left) {
+        const bool toRight = from.right <= to.left;
+        bridge.left = (toRight ? from.right : to.right) - margin;
+        bridge.right = (toRight ? to.left : from.left) + margin;
+        bridge.top = std::max<LONG>(from.top, to.top) - margin;
+        bridge.bottom = std::min<LONG>(from.bottom, to.bottom) + margin;
+    } else if (from.bottom <= to.top || to.bottom <= from.top) {
+        const bool toBelow = from.bottom <= to.top;
+        bridge.top = (toBelow ? from.bottom : to.bottom) - margin;
+        bridge.bottom = (toBelow ? to.top : from.top) + margin;
+        bridge.left = std::max<LONG>(from.left, to.left) - margin;
+        bridge.right = std::min<LONG>(from.right, to.right) + margin;
+    } else {
+        return false;
+    }
+    return bridge.left < bridge.right && bridge.top < bridge.bottom && PointInRect(bridge, pt);
+}
+
 class PreviewWindow {
     HWND hwnd_ = nullptr;
     HWND host_ = nullptr;
@@ -1029,8 +1568,8 @@ public:
         volumeSliderRect_ = { volumeIconRect_.left + 6, volumeIconRect_.top - 124, volumeIconRect_.right - 6, volumeIconRect_.top - 4 };
     }
 
-    RECT ClampRectToMonitor(RECT wanted) {
-        HMONITOR mon = MonitorFromPoint(anchor_, MONITOR_DEFAULTTONEAREST);
+    RECT ClampRectToMonitor(RECT wanted, POINT monitorPoint) {
+        HMONITOR mon = MonitorFromPoint(monitorPoint, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfoW(mon, &mi);
         RECT work = mi.rcWork;
@@ -1047,9 +1586,43 @@ public:
         int width = WindowWidth();
         int height = WindowHeight();
         RECT wanted{ anchor.x + 18, anchor.y + 18, anchor.x + 18 + width, anchor.y + 18 + height };
-        wanted = ClampRectToMonitor(wanted);
+        wanted = ClampRectToMonitor(wanted, anchor);
         POINT topLeft{ wanted.left, wanted.top };
         return ShowPathAt(path, kind, topLeft, anchor);
+    }
+
+    bool ShowPathNearItem(const std::wstring& path, MediaKind kind, const RECT& itemRect, POINT cursor) {
+        const int width = WindowWidth();
+        const int height = WindowHeight();
+        const int gap = 14;
+        POINT center{ (itemRect.left + itemRect.right) / 2, (itemRect.top + itemRect.bottom) / 2 };
+        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(mon, &mi);
+        const RECT work = mi.rcWork;
+        const POINT candidates[] = {
+            { itemRect.right + gap, itemRect.top },
+            { itemRect.left - width - gap, itemRect.top },
+            { itemRect.left, itemRect.bottom + gap },
+            { itemRect.left, itemRect.top - height - gap }
+        };
+        for (POINT topLeft : candidates) {
+            RECT candidate{ topLeft.x, topLeft.y, topLeft.x + width, topLeft.y + height };
+            RECT intersection{};
+            if (candidate.left >= work.left && candidate.top >= work.top &&
+                candidate.right <= work.right && candidate.bottom <= work.bottom &&
+                !IntersectRect(&intersection, &candidate, &itemRect)) {
+                return ShowPathAt(path, kind, topLeft, cursor);
+            }
+        }
+        RECT fallback{ itemRect.right + gap, itemRect.top, itemRect.right + gap + width, itemRect.top + height };
+        fallback = ClampRectToMonitor(fallback, center);
+        RECT intersection{};
+        if (IntersectRect(&intersection, &fallback, &itemRect)) {
+            fallback.left = std::max<LONG>(work.left + 8, itemRect.left - width - gap);
+            fallback.right = fallback.left + width;
+        }
+        return ShowPathAt(path, kind, POINT{ fallback.left, fallback.top }, cursor);
     }
 
     bool ShowPathAt(const std::wstring& path, MediaKind kind, POINT topLeft, POINT logicalAnchor, bool startPaused = false) {
@@ -1065,7 +1638,7 @@ public:
         int width = WindowWidth();
         int height = WindowHeight();
         RECT r{ topLeft.x, topLeft.y, topLeft.x + width, topLeft.y + height };
-        r = ClampRectToMonitor(r);
+        r = ClampRectToMonitor(r, logicalAnchor);
         SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         Layout(r.right - r.left, r.bottom - r.top);
         InvalidateRect(hwnd_, nullptr, TRUE);
@@ -1083,6 +1656,30 @@ public:
         bool allowAudio = settings_->audioOnStart && (kind == MediaKind::Audio || kind == MediaKind::Video);
         const bool loaded = player_.LoadFile(path, allowAudio, settings_->volumePercent, startPaused);
         Log(std::wstring(L"PreviewWindow: load ") + (loaded ? L"ok: " : L"failed: ") + path);
+        RegisterEscape();
+        return loaded;
+    }
+
+    bool ShowPathAtExplicit(const std::wstring& path, MediaKind kind, RECT requested, POINT logicalAnchor, bool allowAudio, int volumePercent, bool startPaused = false) {
+        if (!hwnd_ || !host_ || !settings_) return false;
+        currentPath_ = path;
+        currentKind_ = kind;
+        anchor_ = logicalAnchor;
+        timePos_ = 0.0;
+        duration_ = 0.0;
+        volumePopupVisible_ = false;
+        draggingVolume_ = false;
+        const int width = std::clamp<int>(requested.right - requested.left, 160, 8192);
+        const int height = std::clamp<int>(requested.bottom - requested.top, 90, 8192);
+        RECT r{ requested.left, requested.top, requested.left + width, requested.top + height };
+        r = ClampRectToMonitor(r, logicalAnchor);
+        SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right-r.left, r.bottom-r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        Layout(r.right-r.left, r.bottom-r.top);
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        if (!player_.Initialize(hwnd_, host_)) { RegisterEscape(); return false; }
+        player_.Stop();
+        const bool loaded = player_.LoadFile(path, allowAudio && (kind == MediaKind::Audio || kind == MediaKind::Video), volumePercent, startPaused);
+        Log(std::wstring(L"PreviewWindow: external load ") + (loaded ? L"ok: " : L"failed: ") + path);
         RegisterEscape();
         return loaded;
     }
@@ -1371,9 +1968,13 @@ class SettingsDialog {
 
     enum : int {
         IDC_RESOLUTION = 3101,
-        IDC_DELAY = 3102,
+        IDC_HOVER_DELAY = 3102,
         IDC_AUDIO = 3103,
         IDC_COLOR = 3104,
+        IDC_HOVER_ENABLED = 3105,
+        IDC_STOP_ON_LEAVE = 3106,
+        IDC_CONFIRM_MULTI = 3107,
+        IDC_ALLOW_PREVIEW_POINTER = 3108,
         IDC_OK = IDOK,
         IDC_CANCEL = IDCANCEL
     };
@@ -1385,7 +1986,6 @@ public:
         settings_ = &settings;
         done_ = false;
         applied_ = false;
-
         darkBg_ = CreateSolidBrush(RGB(24, 24, 24));
         darkEditBg_ = CreateSolidBrush(RGB(38, 38, 38));
 
@@ -1401,11 +2001,10 @@ public:
         hwnd_ = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             cls.lpszClassName, L"MvView 設定",
             WS_CAPTION | WS_SYSMENU | WS_POPUP,
-            CW_USEDEFAULT, CW_USEDEFAULT, 520, 410,
+            CW_USEDEFAULT, CW_USEDEFAULT, 700, 650,
             owner_, nullptr, inst_, this);
         if (!hwnd_) return false;
         TryEnableDarkModeForWindow(hwnd_);
-
         CenterToOwner();
         EnableWindow(owner_, FALSE);
         ShowWindow(hwnd_, SW_SHOW);
@@ -1421,10 +2020,14 @@ public:
 
         EnableWindow(owner_, TRUE);
         SetForegroundWindow(owner_);
-        if (darkBg_) { DeleteObject(darkBg_); darkBg_ = nullptr; }
-        if (darkEditBg_) { DeleteObject(darkEditBg_); darkEditBg_ = nullptr; }
-        if (uiFont_) { DeleteObject(uiFont_); uiFont_ = nullptr; }
-        if (uiFontBold_) { DeleteObject(uiFontBold_); uiFontBold_ = nullptr; }
+        if (darkBg_) DeleteObject(darkBg_);
+        if (darkEditBg_) DeleteObject(darkEditBg_);
+        if (uiFont_) DeleteObject(uiFont_);
+        if (uiFontBold_ && uiFontBold_ != uiFont_) DeleteObject(uiFontBold_);
+        darkBg_ = nullptr;
+        darkEditBg_ = nullptr;
+        uiFont_ = nullptr;
+        uiFontBold_ = nullptr;
         return applied_;
     }
 
@@ -1455,26 +2058,18 @@ private:
             HDC hdc = reinterpret_cast<HDC>(wp);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(245, 245, 245));
-            HBRUSH brush = self->darkBg_ ? self->darkBg_ : (HBRUSH)GetStockObject(BLACK_BRUSH);
-            return reinterpret_cast<LRESULT>(brush);
+            return reinterpret_cast<LRESULT>(self->darkBg_ ? self->darkBg_ : (HBRUSH)GetStockObject(BLACK_BRUSH));
         }
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX: {
             HDC hdc = reinterpret_cast<HDC>(wp);
             SetBkColor(hdc, RGB(38, 38, 38));
             SetTextColor(hdc, RGB(245, 245, 245));
-            HBRUSH brush = self->darkEditBg_ ? self->darkEditBg_ : (HBRUSH)GetStockObject(BLACK_BRUSH);
-            return reinterpret_cast<LRESULT>(brush);
+            return reinterpret_cast<LRESULT>(self->darkEditBg_ ? self->darkEditBg_ : (HBRUSH)GetStockObject(BLACK_BRUSH));
         }
         case WM_COMMAND:
-            switch (LOWORD(wp)) {
-            case IDC_OK:
-                self->ApplyAndClose();
-                return 0;
-            case IDC_CANCEL:
-                self->Close(false);
-                return 0;
-            }
+            if (LOWORD(wp) == IDC_OK) { self->ApplyAndClose(); return 0; }
+            if (LOWORD(wp) == IDC_CANCEL) { self->Close(false); return 0; }
             break;
         case WM_CLOSE:
             self->Close(false);
@@ -1501,79 +2096,94 @@ private:
     HWND AddLabel(const wchar_t* text, int x, int y, int w, int h, bool bold = false) {
         HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE,
             x, y, w, h, hwnd_, nullptr, inst_, nullptr);
-        SendMessageW(label, WM_SETFONT, (WPARAM)(bold && uiFontBold_ ? uiFontBold_ : uiFont_), TRUE);
+        SendMessageW(label, WM_SETFONT, (WPARAM)(bold ? uiFontBold_ : uiFont_), TRUE);
         return label;
     }
 
     HWND AddCombo(int id, int x, int y, int w, int h) {
-        return CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        HWND combo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
             x, y, w, h, hwnd_, (HMENU)(INT_PTR)id, inst_, nullptr);
+        SendMessageW(combo, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        return combo;
+    }
+
+    void AddCheck(int id, const wchar_t* text, int x, int y, bool checked) {
+        HWND check = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            x, y, 28, 30, hwnd_, (HMENU)(INT_PTR)id, inst_, nullptr);
+        SendMessageW(check, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+        AddLabel(text, x + 38, y + 1, 560, 30, true);
     }
 
     void CreateControls() {
-        uiFont_ = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        uiFont_ = CreateFontW(-19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
             DEFAULT_PITCH, L"Meiryo UI");
-        uiFontBold_ = CreateFontW(-19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        uiFontBold_ = CreateFontW(-20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
             DEFAULT_PITCH, L"Meiryo UI");
         if (!uiFont_) uiFont_ = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         if (!uiFontBold_) uiFontBold_ = uiFont_;
 
-        AddLabel(L"Preview 解像度", 24, 28, 150, 28, true);
-        HWND res = AddCombo(IDC_RESOLUTION, 190, 24, 250, 180);
+        AddCheck(IDC_HOVER_ENABLED, L"ホバーでプレビュー", 28, 24, settings_->hoverPreviewEnabled);
+
+        AddLabel(L"ホバー開始までの時間", 28, 76, 225, 30, true);
+        HWND delay = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            270, 72, 110, 32, hwnd_, (HMENU)(INT_PTR)IDC_HOVER_DELAY, inst_, nullptr);
+        wchar_t delayText[32]{};
+        StringCchPrintfW(delayText, 32, L"%.1f", settings_->hoverPreviewDelayMs / 1000.0);
+        SetWindowTextW(delay, delayText);
+        SendMessageW(delay, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+        AddLabel(L"秒（0.0 ～ 5.0）", 394, 76, 220, 30);
+
+        AddCheck(IDC_STOP_ON_LEAVE, L"対象から外れたらすぐ停止", 28, 124, settings_->stopImmediatelyOnHoverLeave);
+        AddCheck(IDC_CONFIRM_MULTI, L"複数選択時に確認する", 28, 170, settings_->confirmMultipleSelection);
+        AddCheck(IDC_ALLOW_PREVIEW_POINTER, L"プレビュー上への移動を許可", 28, 216, settings_->allowPointerOverPreview);
+        AddCheck(IDC_AUDIO, L"プレビュー開始時に音を出す", 28, 262, settings_->audioOnStart);
+
+        AddLabel(L"Preview 解像度", 28, 318, 190, 30, true);
+        HWND res = AddCombo(IDC_RESOLUTION, 270, 314, 300, 190);
         const wchar_t* resolutions[] = { L"720p", L"480p", L"360p", L"240p", L"180p" };
         const int resValues[] = { 720, 480, 360, 240, 180 };
         for (auto text : resolutions) SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)text);
         int resSel = 2;
         for (int i = 0; i < 5; ++i) if (settings_->previewResolutionP == resValues[i]) resSel = i;
         SendMessageW(res, CB_SETCURSEL, resSel, 0);
-        SendMessageW(res, WM_SETFONT, (WPARAM)uiFont_, TRUE);
 
-        AddLabel(L"待機時間 秒", 24, 78, 150, 28, true);
-        HWND delay = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            190, 74, 100, 28, hwnd_, (HMENU)(INT_PTR)IDC_DELAY, inst_, nullptr);
-        wchar_t delayText[32]{};
-        StringCchPrintfW(delayText, 32, L"%.1f", settings_->previewDelayMs / 1000.0);
-        SetWindowTextW(delay, delayText);
-        SendMessageW(delay, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-        AddLabel(L"0.0 ～ 5.0", 304, 78, 120, 28);
-
-        HWND audio = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            190, 122, 24, 28, hwnd_, (HMENU)(INT_PTR)IDC_AUDIO, inst_, nullptr);
-        SendMessageW(audio, BM_SETCHECK, settings_->audioOnStart ? BST_CHECKED : BST_UNCHECKED, 0);
-        SendMessageW(audio, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-        AddLabel(L"プレビュー開始時に音を出す", 224, 124, 260, 28, true);
-
-        AddLabel(L"プレビュー枠色", 24, 174, 150, 28, true);
-        HWND color = AddCombo(IDC_COLOR, 190, 170, 250, 190);
+        AddLabel(L"プレビュー枠色", 28, 372, 190, 30, true);
+        HWND color = AddCombo(IDC_COLOR, 270, 368, 300, 200);
         const wchar_t* colors[] = { L"明るい黄色", L"アクア", L"グリーン", L"オレンジ", L"ピンク", L"ホワイト", L"パープル" };
         for (auto text : colors) SendMessageW(color, CB_ADDSTRING, 0, (LPARAM)text);
         SendMessageW(color, CB_SETCURSEL, settings_->borderColorIndex, 0);
-        SendMessageW(color, WM_SETFONT, (WPARAM)uiFont_, TRUE);
+
+        AddLabel(L"Explorer のファイル一覧項目だけを対象にします。クリックや選択変更だけでは開始しません。",
+            28, 438, 620, 58, false);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            240, 312, 92, 34, hwnd_, (HMENU)(INT_PTR)IDC_OK, inst_, nullptr);
+            410, 535, 100, 38, hwnd_, (HMENU)(INT_PTR)IDC_OK, inst_, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE,
-            350, 312, 110, 34, hwnd_, (HMENU)(INT_PTR)IDC_CANCEL, inst_, nullptr);
+            530, 535, 120, 38, hwnd_, (HMENU)(INT_PTR)IDC_CANCEL, inst_, nullptr);
         SendMessageW(ok, WM_SETFONT, (WPARAM)uiFontBold_, TRUE);
         SendMessageW(cancel, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     }
 
     void ApplyAndClose() {
+        settings_->hoverPreviewEnabled = SendDlgItemMessageW(hwnd_, IDC_HOVER_ENABLED, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        settings_->stopImmediatelyOnHoverLeave = SendDlgItemMessageW(hwnd_, IDC_STOP_ON_LEAVE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        settings_->confirmMultipleSelection = SendDlgItemMessageW(hwnd_, IDC_CONFIRM_MULTI, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        settings_->allowPointerOverPreview = SendDlgItemMessageW(hwnd_, IDC_ALLOW_PREVIEW_POINTER, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        settings_->audioOnStart = SendDlgItemMessageW(hwnd_, IDC_AUDIO, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+        wchar_t buf[64]{};
+        GetDlgItemTextW(hwnd_, IDC_HOVER_DELAY, buf, 64);
+        double sec = _wtof(buf);
+        sec = std::clamp(sec, 0.0, 5.0);
+        settings_->hoverPreviewDelayMs = (int)(sec * 1000.0 + 0.5);
+        settings_->previewDelayMs = settings_->hoverPreviewDelayMs;
+
         const int resValues[] = { 720, 480, 360, 240, 180 };
         int sel = (int)SendDlgItemMessageW(hwnd_, IDC_RESOLUTION, CB_GETCURSEL, 0, 0);
         if (sel < 0 || sel > 4) sel = 2;
         settings_->previewResolutionP = resValues[sel];
-
-        wchar_t buf[64]{};
-        GetDlgItemTextW(hwnd_, IDC_DELAY, buf, 64);
-        double sec = _wtof(buf);
-        if (sec < 0.0) sec = 0.0;
-        if (sec > 5.0) sec = 5.0;
-        settings_->previewDelayMs = (int)(sec * 1000.0 + 0.5);
-
-        settings_->audioOnStart = SendDlgItemMessageW(hwnd_, IDC_AUDIO, BM_GETCHECK, 0, 0) == BST_CHECKED;
         int colorSel = (int)SendDlgItemMessageW(hwnd_, IDC_COLOR, CB_GETCURSEL, 0, 0);
         settings_->borderColorIndex = std::clamp<int>(colorSel, 0, 6);
         settings_->Clamp();
@@ -1589,6 +2199,178 @@ private:
     }
 };
 
+class MultiConfirmWindow {
+    HWND hwnd_ = nullptr;
+    HWND owner_ = nullptr;
+    HINSTANCE inst_ = nullptr;
+    HWND message_ = nullptr;
+    HWND playButton_ = nullptr;
+    HWND cancelButton_ = nullptr;
+    HBRUSH darkBg_ = nullptr;
+    HFONT font_ = nullptr;
+    HFONT boldFont_ = nullptr;
+
+    enum : int { IDC_PLAY = IDOK, IDC_CANCEL = IDCANCEL };
+
+public:
+    ~MultiConfirmWindow() { Destroy(); }
+    HWND Hwnd() const { return hwnd_; }
+    bool IsVisible() const { return hwnd_ && IsWindowVisible(hwnd_); }
+    bool ContainsScreenPoint(POINT pt) const {
+        if (!IsVisible()) return false;
+        RECT rc{};
+        GetWindowRect(hwnd_, &rc);
+        return PointInRect(rc, pt);
+    }
+
+    RECT WindowRect() const {
+        RECT rc{};
+        if (IsVisible()) GetWindowRect(hwnd_, &rc);
+        return rc;
+    }
+
+    bool Show(HINSTANCE inst, HWND owner, int count, const RECT& avoidRect, COLORREF borderColor) {
+        inst_ = inst;
+        owner_ = owner;
+        if (!CreateIfNeeded()) return false;
+        wchar_t text[160]{};
+        StringCchPrintfW(text, 160, L"%d個のメディアをプレビューしますか？", count);
+        SetWindowTextW(message_, text);
+        SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        SetPropW(hwnd_, L"MvView.BorderColor", (HANDLE)(ULONG_PTR)borderColor);
+
+        const int width = 456;
+        const int height = 176;
+        POINT center{ (avoidRect.left + avoidRect.right) / 2, (avoidRect.top + avoidRect.bottom) / 2 };
+        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(mon, &mi);
+        RECT work = mi.rcWork;
+        int x = avoidRect.right + 14;
+        int y = avoidRect.top;
+        if (x + width > work.right) x = avoidRect.left - width - 14;
+        if (x < work.left) x = std::clamp(center.x - width / 2, work.left + 8, work.right - width - 8);
+        if (y + height > work.bottom) y = work.bottom - height - 8;
+        if (y < work.top) y = work.top + 8;
+        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
+        ShowWindow(hwnd_, SW_SHOW);
+        SetForegroundWindow(hwnd_);
+        SetFocus(playButton_);
+        InvalidateRect(hwnd_, nullptr, TRUE);
+        return true;
+    }
+
+    void Hide() {
+        if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+    }
+
+    void Destroy() {
+        if (hwnd_) DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+        if (darkBg_) DeleteObject(darkBg_);
+        if (font_) DeleteObject(font_);
+        if (boldFont_ && boldFont_ != font_) DeleteObject(boldFont_);
+        darkBg_ = nullptr;
+        font_ = nullptr;
+        boldFont_ = nullptr;
+    }
+
+private:
+    bool CreateIfNeeded() {
+        if (hwnd_) return true;
+        WNDCLASSW cls{};
+        cls.lpfnWndProc = MultiConfirmWindow::WndProc;
+        cls.hInstance = inst_;
+        cls.lpszClassName = L"MvView.MultiConfirmWindow";
+        cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        cls.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        cls.hIcon = LoadIconW(inst_, MAKEINTRESOURCEW(IDI_APP));
+        RegisterClassW(&cls);
+        darkBg_ = CreateSolidBrush(RGB(22, 22, 22));
+        font_ = CreateFontW(-19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Meiryo UI");
+        boldFont_ = CreateFontW(-20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Meiryo UI");
+        hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
+            cls.lpszClassName, L"",
+            WS_POPUP,
+            CW_USEDEFAULT, CW_USEDEFAULT, 456, 176,
+            owner_, nullptr, inst_, this);
+        if (!hwnd_) return false;
+        TryEnableDarkModeForWindow(hwnd_);
+        message_ = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER,
+            24, 30, 408, 44, hwnd_, nullptr, inst_, nullptr);
+        playButton_ = CreateWindowExW(0, L"BUTTON", L"再生", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            124, 104, 92, 38, hwnd_, (HMENU)(INT_PTR)IDC_PLAY, inst_, nullptr);
+        cancelButton_ = CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE,
+            242, 104, 104, 38, hwnd_, (HMENU)(INT_PTR)IDC_CANCEL, inst_, nullptr);
+        SendMessageW(message_, WM_SETFONT, (WPARAM)boldFont_, TRUE);
+        SendMessageW(playButton_, WM_SETFONT, (WPARAM)boldFont_, TRUE);
+        SendMessageW(cancelButton_, WM_SETFONT, (WPARAM)font_, TRUE);
+        return true;
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        MultiConfirmWindow* self = reinterpret_cast<MultiConfirmWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            auto cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+            self = reinterpret_cast<MultiConfirmWindow*>(cs->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            if (self) self->hwnd_ = hwnd;
+        }
+        if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+        switch (msg) {
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDC_PLAY) {
+                self->Hide();
+                PostMessageW(self->owner_, WM_MV_MULTI_CONFIRM, 1, 0);
+                return 0;
+            }
+            if (LOWORD(wp) == IDC_CANCEL) {
+                self->Hide();
+                PostMessageW(self->owner_, WM_MV_MULTI_CONFIRM, 0, 0);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            self->Hide();
+            PostMessageW(self->owner_, WM_MV_MULTI_CONFIRM, 0, 0);
+            return 0;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN: {
+            HDC hdc = reinterpret_cast<HDC>(wp);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(248, 248, 238));
+            return reinterpret_cast<LRESULT>(self->darkBg_);
+        }
+        case WM_ERASEBKGND: {
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            FillRect(reinterpret_cast<HDC>(wp), &rc, self->darkBg_);
+            return 1;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            FillRect(hdc, &rc, self->darkBg_);
+            COLORREF color = (COLORREF)(ULONG_PTR)GetPropW(hwnd, L"MvView.BorderColor");
+            HPEN pen = CreatePen(PS_SOLID, 3, color ? color : RGB(255, 232, 92));
+            HGDIOBJ old = SelectObject(hdc, pen);
+            HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, 1, 1, rc.right - 1, rc.bottom - 1, 16, 16);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+};
+
 
 class SplashWindow {
     HWND hwnd_ = nullptr;
@@ -1597,6 +2379,7 @@ class SplashWindow {
     HFONT subFont_ = nullptr;
     HFONT smallFont_ = nullptr;
     HICON icon_ = nullptr;
+    HBITMAP splashBitmap_ = nullptr;
     static constexpr UINT TIMER_SPLASH_CLOSE_LOCAL = 7201;
 
 public:
@@ -1605,6 +2388,7 @@ public:
         if (titleFont_) DeleteObject(titleFont_);
         if (subFont_) DeleteObject(subFont_);
         if (smallFont_) DeleteObject(smallFont_);
+        if (splashBitmap_) DeleteObject(splashBitmap_);
     }
 
     bool Create(HINSTANCE inst) {
@@ -1624,8 +2408,8 @@ public:
             }
         }
 
-        const int w = 460;
-        const int h = 230;
+        const int w = 720;
+        const int h = 405;
         POINT pt{};
         GetCursorPos(&pt);
         HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -1675,6 +2459,10 @@ private:
                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
         }
         if (!icon_) icon_ = LoadIconW(inst_, MAKEINTRESOURCEW(IDI_APP));
+        if (!splashBitmap_) {
+            splashBitmap_ = (HBITMAP)LoadImageW(inst_, MAKEINTRESOURCEW(IDB_SPLASH), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+            if (!splashBitmap_) Log(L"SplashWindow: splash bitmap load failed: " + FormatWin32Error(GetLastError()));
+        }
     }
 
     void Paint() {
@@ -1682,6 +2470,31 @@ private:
         HDC hdc = BeginPaint(hwnd_, &ps);
         RECT rc{};
         GetClientRect(hwnd_, &rc);
+        EnsureFonts();
+        if (splashBitmap_) {
+            BITMAP bm{};
+            GetObjectW(splashBitmap_, sizeof(bm), &bm);
+            HDC memDc = CreateCompatibleDC(hdc);
+            HGDIOBJ oldBitmap = SelectObject(memDc, splashBitmap_);
+            SetStretchBltMode(hdc, HALFTONE);
+            SetBrushOrgEx(hdc, 0, 0, nullptr);
+            StretchBlt(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                memDc, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+            SelectObject(memDc, oldBitmap);
+            DeleteDC(memDc);
+
+            // The version remains live text rather than being baked into the image.
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(255, 239, 94));
+            HFONT oldVersionFont = (HFONT)SelectObject(hdc, smallFont_);
+            RECT versionRc{ rc.right - 150, 20, rc.right - 28, 52 };
+            std::wstring versionText = std::wstring(L"v") + kAppVersion;
+            DrawTextW(hdc, versionText.c_str(), -1, &versionRc, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, oldVersionFont);
+            EndPaint(hwnd_, &ps);
+            return;
+        }
+
         HBRUSH bg = CreateSolidBrush(RGB(18, 18, 18));
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
@@ -1694,14 +2507,13 @@ private:
         SelectObject(hdc, oldBrush);
         DeleteObject(borderPen);
 
-        EnsureFonts();
         SetBkMode(hdc, TRANSPARENT);
         if (icon_) DrawIconEx(hdc, 26, 34, icon_, 72, 72, 0, nullptr, DI_NORMAL);
 
         SetTextColor(hdc, RGB(255, 248, 150));
         HFONT oldFont = (HFONT)SelectObject(hdc, titleFont_);
         RECT titleRc{ 118, 36, rc.right - 24, 78 };
-        DrawTextW(hdc, L"MvView v0.20", -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        DrawTextW(hdc, kAppDisplayName, -1, &titleRc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
         SetTextColor(hdc, RGB(235, 235, 235));
         SelectObject(hdc, subFont_);
@@ -1801,7 +2613,7 @@ public:
             std::wstring msg = L"MvView could not add the task tray icon.\n\n"
                 L"Shell_NotifyIcon(NIM_ADD) failed: " + FormatWin32Error(err) + L"\n\n"
                 L"Log: " + LogPath();
-            MessageBoxW(owner_, msg.c_str(), L"MvView v0.20 tray error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+            MessageBoxW(owner_, msg.c_str(), MVVIEW_APP_DISPLAY_NAME_W L" tray error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
             return false;
         }
 
@@ -1866,36 +2678,60 @@ class MvViewApp {
     ExplorerReader explorer_;
     PreviewWindow preview_;
     std::vector<std::unique_ptr<PreviewWindow>> extraPreviews_;
+    MultiConfirmWindow multiConfirm_;
     TrayIcon tray_;
     SplashWindow splash_;
     HWINEVENTHOOK hookForeground_ = nullptr;
     HWINEVENTHOOK hookSelection_ = nullptr;
     HHOOK mouseHook_ = nullptr;
-    POINT pendingAnchor_{};
-    std::wstring pendingPath_;
-    std::wstring visibleMediaSetKey_;
-    bool pendingFromMouseMove_ = false;
-    bool pendingFromMouseClick_ = false;
-    bool pendingFromSelectionEvent_ = false;
-    bool allowMouseReturnStart_ = false;
-    bool multiPreviewActive_ = false;
-    RECT previewGroupRect_{};
+
+    PreviewTrigger previewTrigger_ = PreviewTrigger::None;
+    HoverState hoverState_ = HoverState::Idle;
+    HoverTarget hoverTarget_;
+    POINT latestMousePoint_{};
+    bool latestMousePointKnown_ = false;
+    POINT hoverStartPosition_{};
+    ULONGLONG hoverStartTick_ = 0;
+    ULONGLONG hoverLeaveTick_ = 0;
+    ULONGLONG exitGraceUntil_ = 0;
+    ULONGLONG lastFullResolveTick_ = 0;
+    ULONGLONG lastSuccessfulResolveTick_ = 0;
+    ULONGLONG lastSelectionValidationTick_ = 0;
+    ULONGLONG confirmMoveGraceUntil_ = 0;
+    POINT lastFullResolvePoint_{};
+    bool lastFullResolvePointKnown_ = false;
+    bool forceHoverResolve_ = true;
+
+    HWND currentExplorerRoot_ = nullptr;
+    std::wstring currentTabKey_;
+    std::vector<std::pair<std::wstring, MediaKind>> pendingMultiMedia_;
+    std::vector<std::pair<std::wstring, MediaKind>> playingMedia_;
+    std::wstring pendingSelectionKey_;
+    std::wstring playingSelectionKey_;
+    std::wstring suppressedConfirmationKey_;
+    bool confirmationRequiresLeave_ = false;
+
     bool comReady_ = false;
     bool mpvRuntimeReady_ = false;
     std::wstring mpvRuntimeStatus_;
     UINT taskbarCreatedMsg_ = 0;
+    DWORD externalHoverSourcePid_ = 0;
+    unsigned long long externalHoverGeneration_ = 0;
+    std::wstring externalHoverRequestId_;
 
 public:
-    int Run(HINSTANCE inst, int show, const std::wstring& initialOpenPath = L"") {
+    int Run(HINSTANCE inst, int, const std::wstring& initialOpenPath = L"") {
         inst_ = inst;
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         TryEnableAppDarkMode();
         taskbarCreatedMsg_ = RegisterWindowMessageW(L"TaskbarCreated");
 
         HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        comReady_ = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+        comReady_ = SUCCEEDED(hr);
+        if (hr == RPC_E_CHANGED_MODE) Log(L"COM was already initialized with a different apartment model");
+        else if (FAILED(hr)) Log(L"CoInitializeEx failed: HRESULT=" + std::to_wstring((long)hr));
         settings_.Load();
-        Log(L"MvView v0.20 started");
+        Log(std::wstring(kAppDisplayName) + L" started");
         Log(L"EXE path: " + GetModulePathText());
         splash_.Create(inst_);
 
@@ -1904,30 +2740,34 @@ public:
             Log(L"CreateMainWindow failed: " + FormatWin32Error(err));
             splash_.Close();
             MessageBoxW(nullptr, (L"MvView main window creation failed.\n\n" + FormatWin32Error(err) + L"\n\nLog: " + LogPath()).c_str(),
-                L"MvView v0.20 startup error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+                MVVIEW_APP_DISPLAY_NAME_W L" startup error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
             return 1;
         }
-
-        if (!tray_.Add(hwnd_, inst_, L"MvView v0.20 / starting")) {
+        if (!tray_.Add(hwnd_, inst_, MVVIEW_APP_DISPLAY_NAME_W L" / starting")) {
             Log(L"startup aborted because tray icon could not be added");
             splash_.Close();
             return 1;
         }
-
         if (!preview_.Create(inst_, &settings_)) Log(L"PreviewWindow.Create failed: " + FormatWin32Error(GetLastError()));
 
         mpvRuntimeReady_ = ProbeMpvRuntime(&mpvRuntimeStatus_);
         Log(L"runtime status: " + mpvRuntimeStatus_);
         tray_.UpdateTip(MpvTrayTip());
         InstallHooks();
+
         if (!initialOpenPath.empty()) {
             OpenExternalPath(initialOpenPath);
-        } else {
-            ScheduleSelectionCheck(L"startup");
+        } else if (settings_.enabled && settings_.hoverPreviewEnabled) {
+            // A foreground/focus change alone must not start preview. Capture the
+            // current point and wait for an actual mouse movement notification.
+            GetCursorPos(&latestMousePoint_);
+            latestMousePointKnown_ = true;
+            forceHoverResolve_ = true;
         }
 
         MSG msg{};
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (multiConfirm_.IsVisible() && IsDialogMessageW(multiConfirm_.Hwnd(), &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -1941,11 +2781,76 @@ public:
         if (path.empty() || !FileExists(path)) return;
         MediaKind kind = DetectMediaKind(path);
         if (kind == MediaKind::None) return;
+        ClosePreview(PreviewCloseReason::DirectOpenReplaced);
         POINT pt{};
         GetCursorPos(&pt);
         Log(L"external open: " + path);
-        preview_.ShowPath(path, kind, pt);
-        SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 250, nullptr);
+        if (preview_.ShowPath(path, kind, pt)) {
+            previewTrigger_ = PreviewTrigger::DirectOpen;
+            hoverState_ = HoverState::PlayingSingle;
+            playingMedia_ = { { path, kind } };
+            SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 200, nullptr);
+        }
+    }
+
+    bool IsExternalHoverCurrent(const ExternalHoverRequest& request) const {
+        if (externalHoverSourcePid_ == 0) return true;
+        if (request.sourcePid != externalHoverSourcePid_) return request.generation > externalHoverGeneration_;
+        return request.generation >= externalHoverGeneration_;
+    }
+
+    void OpenExternalHover(const ExternalHoverRequest& request) {
+        if (!IsExternalHoverCurrent(request)) { Log(L"external hover ignored: stale open"); return; }
+        ClosePreview(PreviewCloseReason::ExternalHoverReplaced);
+        externalHoverSourcePid_ = request.sourcePid;
+        externalHoverGeneration_ = request.generation;
+        externalHoverRequestId_ = request.requestId;
+        std::vector<std::pair<std::wstring, MediaKind>> media;
+        for (const auto& path : request.paths) {
+            MediaKind kind = DetectMediaKind(path);
+            if (kind != MediaKind::None) media.push_back({path, kind});
+            if (media.size() >= 9) break;
+        }
+        if (media.empty()) return;
+        const int count = static_cast<int>(media.size());
+        const int cols = count <= 3 ? count : (count <= 4 ? 2 : 3);
+        const int rows = (count + cols - 1) / cols;
+        const int gap = count > 1 ? 8 : 0;
+        const int totalW = std::max<int>(160, request.geometry.right-request.geometry.left);
+        const int totalH = std::max<int>(90, request.geometry.bottom-request.geometry.top);
+        const int cellW = std::max<int>(160, (totalW - (cols-1)*gap) / std::max(1, cols));
+        const int cellH = std::max<int>(90, (totalH - (rows-1)*gap) / std::max(1, rows));
+        preview_.Hide(); CloseExtraPreviews();
+        for (int i=0; i<count; ++i) {
+            PreviewWindow* window = nullptr;
+            if (i == 0) window = &preview_;
+            else { auto extra=std::make_unique<PreviewWindow>(); if (!extra->Create(inst_, &settings_)) continue; window=extra.get(); extraPreviews_.push_back(std::move(extra)); }
+            int col=i%cols, row=i/cols;
+            RECT cell{ request.geometry.left + col*(cellW+gap), request.geometry.top + row*(cellH+gap), request.geometry.left + col*(cellW+gap)+cellW, request.geometry.top + row*(cellH+gap)+cellH };
+            const bool audible = !request.audiblePath.empty() && _wcsicmp(request.audiblePath.c_str(), media[i].first.c_str()) == 0;
+            window->ShowPathAtExplicit(media[i].first, media[i].second, cell, request.cursor, audible, request.volumePercent, count > 1);
+        }
+        if (count > 1) { preview_.StartPlayback(); for (auto& w:extraPreviews_) if(w) w->StartPlayback(); }
+        previewTrigger_ = PreviewTrigger::ExternalHover;
+        hoverState_ = count > 1 ? HoverState::PlayingMulti : HoverState::PlayingSingle;
+        playingMedia_ = media;
+        SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 200, nullptr);
+        Log(L"external hover open request=" + request.requestId + L" generation=" + std::to_wstring(request.generation));
+    }
+
+    void CloseExternalHover(const ExternalHoverRequest& request) {
+        if (previewTrigger_ != PreviewTrigger::ExternalHover) return;
+        if (request.sourcePid != externalHoverSourcePid_ || request.generation < externalHoverGeneration_) { Log(L"external hover ignored: stale close"); return; }
+        externalHoverGeneration_ = request.generation;
+        Log(L"external hover close request=" + request.requestId + L" generation=" + std::to_wstring(request.generation));
+        ClosePreview(PreviewCloseReason::HoverLeft);
+        externalHoverSourcePid_ = 0; externalHoverRequestId_.clear();
+    }
+
+    void MoveExternalHover(const ExternalHoverRequest& request) {
+        if (previewTrigger_ != PreviewTrigger::ExternalHover || request.sourcePid != externalHoverSourcePid_ || request.generation < externalHoverGeneration_) return;
+        externalHoverGeneration_ = request.generation;
+        if (!request.paths.empty()) OpenExternalHover(request);
     }
 
 private:
@@ -1955,28 +2860,22 @@ private:
         cls.hInstance = inst_;
         cls.lpszClassName = kMainWindowClass;
         cls.hIcon = LoadIconW(inst_, MAKEINTRESOURCEW(IDI_APP));
-
         ATOM atom = RegisterClassW(&cls);
         if (!atom) {
             DWORD err = GetLastError();
-            if (err == ERROR_CLASS_ALREADY_EXISTS) {
-                Log(L"RegisterClass skipped: class already exists in this process");
-            } else {
+            if (err != ERROR_CLASS_ALREADY_EXISTS) {
                 Log(L"RegisterClass failed: " + FormatWin32Error(err));
                 return false;
             }
-        } else {
-            Log(L"RegisterClass succeeded for main window");
         }
-
         SetLastError(ERROR_SUCCESS);
         hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW, kMainWindowClass, kAppName, WS_POPUP,
             0, 0, 1, 1, nullptr, nullptr, inst_, this);
         if (!hwnd_) {
-            DWORD err = GetLastError();
-            Log(L"CreateWindowEx failed: " + FormatWin32Error(err));
+            Log(L"CreateWindowEx failed: " + FormatWin32Error(GetLastError()));
             return false;
         }
+        gHookTargetWindow = hwnd_;
         Log(L"Main hidden window created");
         return true;
     }
@@ -1985,26 +2884,24 @@ private:
         hookForeground_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         hookSelection_ = SetWinEventHook(EVENT_OBJECT_FOCUS_VALUE, EVENT_OBJECT_SELECTIONWITHIN_VALUE, nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
         mouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(nullptr), 0);
-
-        if (!hookForeground_) Log(L"SetWinEventHook foreground failed: " + FormatWin32Error(GetLastError()));
-        else Log(L"SetWinEventHook foreground installed");
-
-        if (!hookSelection_) Log(L"SetWinEventHook selection/focus failed: " + FormatWin32Error(GetLastError()));
-        else Log(L"SetWinEventHook selection/focus installed");
-
-        if (!mouseHook_) Log(L"SetWindowsHookEx(WH_MOUSE_LL) failed: " + FormatWin32Error(GetLastError()));
-        else Log(L"SetWindowsHookEx(WH_MOUSE_LL) installed");
+        Log(hookForeground_ ? L"SetWinEventHook foreground installed" : L"SetWinEventHook foreground failed");
+        Log(hookSelection_ ? L"SetWinEventHook selection/focus installed" : L"SetWinEventHook selection/focus failed");
+        Log(mouseHook_ ? L"SetWindowsHookEx(WH_MOUSE_LL) installed" : L"SetWindowsHookEx(WH_MOUSE_LL) failed");
     }
 
     void Shutdown() {
-        KillTimer(hwnd_, TIMER_DEBOUNCE);
+        gHookTargetWindow = nullptr;
         KillTimer(hwnd_, TIMER_CURSOR_CLOSE);
+        KillTimer(hwnd_, TIMER_HOVER_MONITOR);
+        KillTimer(hwnd_, TIMER_SELECTION_VALIDATE);
         if (hookForeground_) UnhookWinEvent(hookForeground_);
         if (hookSelection_) UnhookWinEvent(hookSelection_);
         if (mouseHook_) UnhookWindowsHookEx(mouseHook_);
         hookForeground_ = nullptr;
         hookSelection_ = nullptr;
         mouseHook_ = nullptr;
+        ClosePreview(PreviewCloseReason::Shutdown);
+        multiConfirm_.Destroy();
         tray_.Remove();
         preview_.Destroy();
         for (auto& w : extraPreviews_) if (w) w->Destroy();
@@ -2014,241 +2911,493 @@ private:
         if (comReady_) CoUninitialize();
     }
 
-    static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
-        HWND main = FindWindowW(kMainWindowClass, nullptr);
+    static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG, LONG, DWORD, DWORD) {
+        HWND main = gHookTargetWindow;
         if (main) PostMessageW(main, WM_MV_HOOK_EVENT, (WPARAM)event, (LPARAM)hwnd);
     }
 
     static LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wp, LPARAM lp) {
-        if (code == HC_ACTION) {
-            // Mouse clicks are the normal preview trigger.  Mouse move is throttled and
-            // used only to re-arm a previously closed multi-preview when the pointer
-            // returns near the original Explorer selection anchor.
-            bool post = (wp == WM_LBUTTONUP || wp == WM_RBUTTONUP || wp == WM_MBUTTONUP);
-            if (!post && wp == WM_MOUSEMOVE) {
+        if (code == HC_ACTION && lp) {
+            const MSLLHOOKSTRUCT* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+            bool post = wp != WM_MOUSEMOVE;
+            if (wp == WM_MOUSEMOVE) {
                 static DWORD lastMovePost = 0;
                 DWORD now = GetTickCount();
-                if (now - lastMovePost >= 250) {
+                if (now - lastMovePost >= 50) {
                     lastMovePost = now;
                     post = true;
                 }
             }
             if (post) {
-                HWND main = FindWindowW(kMainWindowClass, nullptr);
-                if (main) PostMessageW(main, WM_MV_MOUSE_EVENT, wp, 0);
+                HWND main = gHookTargetWindow;
+                if (main) PostMessageW(main, WM_MV_MOUSE_EVENT, wp, PackScreenPoint(info->pt));
             }
         }
         return CallNextHookEx(nullptr, code, wp, lp);
     }
 
-    bool ForegroundIsExplorer(HWND* outForeground = nullptr) {
+    bool ForegroundIsExplorer(HWND* outRoot = nullptr) const {
         HWND fg = GetForegroundWindow();
-        if (outForeground) *outForeground = fg;
-        return fg && explorer_.IsExplorerWindow(fg);
+        if (!fg || !explorer_.IsExplorerWindow(fg)) return false;
+        HWND root = GetAncestor(fg, GA_ROOT);
+        if (outRoot) *outRoot = root;
+        return true;
     }
 
-    void ScheduleSelectionCheck(const std::wstring& reason) {
-        if (!settings_.enabled) return;
-        HWND fg = nullptr;
-        if (!ForegroundIsExplorer(&fg)) {
-            if (reason.find(L"mouse") != std::wstring::npos || reason.find(L"tray") != std::wstring::npos) {
-                Log(L"selection check skipped; foreground is not Explorer: " + reason);
-            }
-            if (settings_.closeWhenForegroundLost && AnyPreviewVisible()) ClosePreview(L"foreground lost");
-            return;
+    bool IsAppInteractionWindow(HWND hwnd) const {
+        if (!hwnd) return false;
+        if (multiConfirm_.IsVisible() && (hwnd == multiConfirm_.Hwnd() || GetAncestor(hwnd, GA_ROOT) == multiConfirm_.Hwnd())) return true;
+        if (preview_.IsVisible() && (hwnd == preview_.Hwnd() || GetAncestor(hwnd, GA_ROOT) == preview_.Hwnd())) return true;
+        for (const auto& w : extraPreviews_) {
+            if (w && w->IsVisible() && (hwnd == w->Hwnd() || GetAncestor(hwnd, GA_ROOT) == w->Hwnd())) return true;
         }
-
-        const bool fromMouseMove = reason.find(L"mouse move") != std::wstring::npos;
-        const bool fromMouseClick = reason.find(L"mouse click") != std::wstring::npos;
-        const bool fromSelectionEvent = reason.find(L"selection/focus") != std::wstring::npos;
-
-        // Important: WH_MOUSE_LL posts mouse-move messages while the user is waiting
-        // for the debounce timer.  Do not let those moves replace a real click or
-        // Explorer selection event, otherwise a single-selection preview is skipped
-        // as a stale mouse-move replay when the pointer moved even slightly.
-        if (fromMouseMove && (pendingFromMouseClick_ || pendingFromSelectionEvent_)) {
-            Log(L"selection check ignored mouse move during active click/selection debounce");
-            return;
-        }
-
-        if (fromMouseMove) {
-            // Mouse movement must not replay stale single selections, but it is used
-            // for the intended Ctrl-click workflow: select several media files, release
-            // Ctrl, then move the mouse slightly to show the tiled multi-preview.  The
-            // actual single/multi decision is made in CheckSelectionNow().
-            if (AnyPreviewVisible() && !multiPreviewActive_) return;
-            POINT pt{};
-            GetCursorPos(&pt);
-            if (allowMouseReturnStart_) {
-                const int startPx = std::min<int>(180, std::max<int>(90, settings_.cursorFarClosePx));
-                if (std::abs(pt.x - pendingAnchor_.x) > startPx || std::abs(pt.y - pendingAnchor_.y) > startPx) return;
-            } else {
-                pendingAnchor_ = pt;
-            }
-        } else {
-            GetCursorPos(&pendingAnchor_);
-            allowMouseReturnStart_ = false;
-
-            // When the user clicks/selects another file while a tiled multi-preview is
-            // running, stop the old group immediately.  The new preview still honors
-            // the configured wait time before opening.
-            if (AnyPreviewVisible() && multiPreviewActive_) {
-                Log(L"multi preview stopped because a new Explorer selection is pending");
-                ClosePreview(L"new selection pending", false);
-            }
-        }
-
-        pendingFromMouseMove_ = fromMouseMove;
-        pendingFromMouseClick_ = fromMouseClick;
-        pendingFromSelectionEvent_ = fromSelectionEvent;
-        KillTimer(hwnd_, TIMER_DEBOUNCE);
-        SetTimer(hwnd_, TIMER_DEBOUNCE, (UINT)settings_.previewDelayMs, nullptr);
-        Log(L"scheduled selection check: " + reason);
+        return false;
     }
 
-    bool CursorIsOverWindow(HWND hwnd, POINT pt) const {
-        if (!hwnd || !IsWindow(hwnd)) return false;
-        RECT rc{};
-        if (!GetWindowRect(hwnd, &rc)) return false;
-        return PointInRect(rc, pt);
+    void EnsureHoverMonitor() {
+        if ((previewTrigger_ == PreviewTrigger::DirectOpen || previewTrigger_ == PreviewTrigger::ExternalHover)) return;
+        if (hoverState_ != HoverState::Idle || multiConfirm_.IsVisible() || confirmationRequiresLeave_) {
+            SetTimer(hwnd_, TIMER_HOVER_MONITOR, 50, nullptr);
+        }
     }
 
-    bool CursorStillValidForPreview(HWND explorerWindow, bool fromMouseMove) const {
-        POINT pt{};
-        GetCursorPos(&pt);
-        if (CursorInsideAnyPreview(pt)) return true;
-        if (!CursorIsOverWindow(explorerWindow, pt)) return false;
-
-        // A real click/selection event should still be allowed after the preview
-        // delay even if the user moved the pointer within Explorer.  The previous
-        // anchor-distance check made the preview fail whenever the mouse moved even
-        // a little before the wait time elapsed.  Keep the strict suppression only
-        // for mouse-move-originated checks, which are the stale replay risk.
-        if (!fromMouseMove) return true;
-
-        const int startPx = std::min<int>(220, std::max<int>(120, settings_.cursorFarClosePx));
-        return std::abs(pt.x - pendingAnchor_.x) <= startPx && std::abs(pt.y - pendingAnchor_.y) <= startPx;
+    void StopHoverMonitorIfIdle() {
+        if (hoverState_ == HoverState::Idle && !multiConfirm_.IsVisible() && !confirmationRequiresLeave_)
+            KillTimer(hwnd_, TIMER_HOVER_MONITOR);
     }
 
-    void CheckSelectionNow() {
-        KillTimer(hwnd_, TIMER_DEBOUNCE);
-        const bool checkFromMouseMove = pendingFromMouseMove_;
-        const bool checkFromMouseClick = pendingFromMouseClick_;
-        const bool checkFromSelectionEvent = pendingFromSelectionEvent_;
-        pendingFromMouseMove_ = false;
-        pendingFromMouseClick_ = false;
-        pendingFromSelectionEvent_ = false;
-        UNREFERENCED_PARAMETER(checkFromSelectionEvent);
-        if (!settings_.enabled) return;
-        HWND fg = nullptr;
-        if (!ForegroundIsExplorer(&fg)) {
-            if (settings_.closeWhenForegroundLost) ClosePreview(L"foreground lost");
-            return;
-        }
-        std::wstring focusedPath;
-        auto selected = explorer_.GetSelectedPathsForForeground(fg, &focusedPath);
-        Log(L"selection check now: selectedCount=" + std::to_wstring(selected.size()) +
-            (focusedPath.empty() ? L"" : (L" focused=" + focusedPath)));
-        if (selected.empty()) {
-            pendingPath_.clear();
-            Log(L"selection check: empty selection");
-            if (settings_.closeWhenSelectionEmpty) ClosePreview(L"selection empty");
-            return;
-        }
-        for (size_t idx = 0; idx < selected.size() && idx < 8; ++idx) {
-            Log(L"selection item[" + std::to_wstring(idx) + L"]=" + selected[idx]);
-        }
+    bool SameTarget(const HoverTarget& a, const HoverTarget& b) const {
+        return a.explorerRoot == b.explorerRoot && a.tabKey == b.tabKey && a.key == b.key;
+    }
 
-        std::vector<std::pair<std::wstring, MediaKind>> media;
-        for (const auto& p : selected) {
-            MediaKind k = DetectMediaKind(p);
-            if (k != MediaKind::None && FileExists(p)) media.push_back({ p, k });
-        }
-        if (media.empty()) {
-            Log(L"selection check: no supported media in selection");
-            if (settings_.closeOnNonMedia) ClosePreview(L"non-media selected");
-            return;
-        }
-
-        POINT cursorNow{};
-        GetCursorPos(&cursorNow);
-        const bool cursorOverPreview = CursorInsideAnyPreview(cursorNow);
-        const bool cursorOverExplorer = CursorIsOverWindow(fg, cursorNow);
-        if (media.size() <= 1) {
-            if (!CursorStillValidForPreview(fg, checkFromMouseMove)) {
-                Log(L"selection check skipped; cursor is outside Explorer and preview");
-                if (AnyPreviewVisible()) ClosePreview(L"cursor outside Explorer/preview");
-                return;
-            }
-        } else {
-            // Multiple preview is intentionally allowed after Ctrl-click when the
-            // pointer is still anywhere over the Explorer window or over an existing
-            // preview.  The previous strict anchor check was preventing multi-preview
-            // from opening after the user released Ctrl and moved the mouse.
-            if (!cursorOverExplorer && !cursorOverPreview) {
-                Log(L"multi selection check skipped; cursor is outside Explorer and preview");
-                if (AnyPreviewVisible()) ClosePreview(L"cursor outside Explorer/preview");
-                return;
-            }
-        }
-
-        if (checkFromMouseMove) {
-            if (media.size() == 1) {
-                Log(L"selection check skipped; mouse-move event with single selection");
-                return;
-            }
-            Log(allowMouseReturnStart_
-                ? L"selection check: mouse return multi-preview restart allowed"
-                : L"selection check: mouse move multi-selection start allowed");
-        }
-
-        const std::wstring newMediaSetKey = MakeMediaSetKey(media);
-        if (AnyPreviewVisible() && !visibleMediaSetKey_.empty() && newMediaSetKey == visibleMediaSetKey_) {
-            if (multiPreviewActive_ && media.size() > 1 &&
-                ((checkFromMouseMove && allowMouseReturnStart_) || checkFromMouseClick)) {
-                Log(checkFromMouseClick
-                    ? L"selection check: same multi media set clicked again; restart all previews"
-                    : L"selection check: same multi media set visible; restart from return event");
-                ShowMultiple(media);
-            } else {
-                Log(L"selection check: same media set already visible; skip reload");
-            }
-            return;
-        }
-
-        if (media.size() == 1) {
-            const auto& target = media[0].first;
-            if (preview_.IsVisible() && ToLower(preview_.CurrentPath()) == ToLower(target) && extraPreviews_.empty()) {
-                Log(L"selection check: same media already visible; skip reload");
-                return;
-            }
-            CloseExtraPreviews();
-            multiPreviewActive_ = false;
-            allowMouseReturnStart_ = false;
-            SetRectEmpty(&previewGroupRect_);
-            pendingPath_ = target;
-            visibleMediaSetKey_ = newMediaSetKey;
-            Log(L"preview open: " + target);
-            preview_.ShowPath(target, media[0].second, pendingAnchor_);
-        } else {
-            Log(L"multi preview open: count=" + std::to_wstring(media.size()));
-            ShowMultiple(media);
-        }
-        SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 250, nullptr);
+    bool PathInMedia(const std::wstring& path, const std::vector<std::pair<std::wstring, MediaKind>>& media) const {
+        const std::wstring key = ToLower(path);
+        for (const auto& entry : media) if (ToLower(entry.first) == key) return true;
+        return false;
     }
 
     std::wstring MakeMediaSetKey(const std::vector<std::pair<std::wstring, MediaKind>>& media) const {
         std::vector<std::wstring> parts;
-        const size_t maxCount = std::min<size_t>(media.size(), 9);
-        parts.reserve(maxCount);
-        for (size_t i = 0; i < maxCount; ++i) parts.push_back(ToLower(media[i].first));
+        for (const auto& entry : media) parts.push_back(ToLower(entry.first));
         std::sort(parts.begin(), parts.end());
         std::wstring key;
-        for (const auto& p : parts) {
-            key += p;
-            key += L"\n";
-        }
+        for (const auto& p : parts) key += p + L"\n";
         return key;
+    }
+
+    std::vector<std::pair<std::wstring, MediaKind>> ReadSelectedMedia(
+        HWND explorerRoot,
+        std::wstring& selectionKey,
+        std::wstring* tabKey = nullptr) {
+        selectionKey.clear();
+        std::wstring resolvedTab;
+        auto selected = explorer_.GetSelectedPathsForForeground(explorerRoot, &resolvedTab, nullptr, false);
+        std::vector<std::pair<std::wstring, MediaKind>> media;
+        for (const auto& path : selected) {
+            MediaKind kind = DetectMediaKind(path);
+            if (kind != MediaKind::None && FileExists(path)) media.push_back({ path, kind });
+        }
+        selectionKey = MakeMediaSetKey(media);
+        if (tabKey) *tabKey = resolvedTab;
+        return media;
+    }
+
+    void BeginHover(const HoverTarget& target) {
+        hoverTarget_ = target;
+        currentExplorerRoot_ = target.explorerRoot;
+        currentTabKey_ = target.tabKey;
+        hoverStartTick_ = GetTickCount64();
+        hoverStartPosition_ = latestMousePoint_;
+        hoverLeaveTick_ = 0;
+        lastFullResolveTick_ = hoverStartTick_;
+        lastSuccessfulResolveTick_ = hoverStartTick_;
+        pendingMultiMedia_.clear();
+        pendingSelectionKey_.clear();
+
+        std::wstring selectedTab;
+        auto selectedMedia = ReadSelectedMedia(target.explorerRoot, pendingSelectionKey_, &selectedTab);
+        const bool hasMultipleMediaSelection = selectedMedia.size() > 1;
+        const bool targetInMulti = hasMultipleMediaSelection && PathInMedia(target.path, selectedMedia);
+        if (hasMultipleMediaSelection && !targetInMulti) {
+            hoverState_ = HoverState::Idle;
+            Log(L"hover wait cancelled: multiple media are selected but hovered item is not in the selection");
+            EnsureHoverMonitor();
+            return;
+        }
+        if (targetInMulti) {
+            if (!selectedTab.empty() && selectedTab != target.tabKey) {
+                Log(L"hover wait cancelled: Explorer tab identity changed during selection read");
+                ResetHoverTarget();
+                return;
+            }
+            pendingMultiMedia_ = std::move(selectedMedia);
+            hoverState_ = HoverState::WaitingMulti;
+        } else {
+            hoverState_ = HoverState::WaitingSingle;
+        }
+        Log(L"hover enter: " + target.path);
+        Log(L"hover wait started: " + target.path + L" delay=" + std::to_wstring(settings_.hoverPreviewDelayMs) +
+            L"ms position=" + std::to_wstring(hoverStartPosition_.x) + L"," + std::to_wstring(hoverStartPosition_.y));
+        EnsureHoverMonitor();
+    }
+
+    void ResetHoverTarget() {
+        hoverTarget_ = {};
+        currentExplorerRoot_ = nullptr;
+        currentTabKey_.clear();
+        hoverStartTick_ = 0;
+        hoverLeaveTick_ = 0;
+        pendingMultiMedia_.clear();
+        pendingSelectionKey_.clear();
+        if (!AnyPreviewVisible() && !multiConfirm_.IsVisible()) hoverState_ = HoverState::Idle;
+        StopHoverMonitorIfIdle();
+    }
+
+    void CancelHoverWait(const std::wstring& reason) {
+        if (hoverState_ == HoverState::WaitingSingle || hoverState_ == HoverState::WaitingMulti) {
+            Log(L"hover wait cancelled: " + reason);
+        }
+        hoverState_ = HoverState::Idle;
+        ResetHoverTarget();
+    }
+
+    void ProcessHoverSample(POINT pt, bool forceResolve = false) {
+        latestMousePoint_ = pt;
+        latestMousePointKnown_ = true;
+        if (!settings_.enabled || !settings_.hoverPreviewEnabled) return;
+        if ((previewTrigger_ == PreviewTrigger::DirectOpen || previewTrigger_ == PreviewTrigger::ExternalHover)) return;
+
+        HWND fg = GetForegroundWindow();
+        const bool explorerForeground = explorer_.IsExplorerWindow(fg);
+        const bool appInteractionForeground = IsAppInteractionWindow(fg);
+        if (!explorerForeground && !appInteractionForeground) {
+            // Hover discovery is allowed only while Explorer is foreground. Existing
+            // playback follows the legacy closeWhenForegroundLost setting.
+            if (hoverState_ == HoverState::ConfirmingMulti) {
+                multiConfirm_.Hide();
+                Log(L"multi confirmation cancelled: Explorer is not foreground");
+                hoverState_ = HoverState::Idle;
+                ResetHoverTarget();
+            } else if (hoverState_ == HoverState::WaitingSingle || hoverState_ == HoverState::WaitingMulti) {
+                CancelHoverWait(L"Explorer is not foreground");
+            } else if (settings_.closeWhenForegroundLost && hoverState_ != HoverState::Idle) {
+                ClosePreview(PreviewCloseReason::ForegroundLost);
+            }
+            return;
+        }
+
+        ULONGLONG now = GetTickCount64();
+        if ((hoverState_ == HoverState::WaitingMulti || hoverState_ == HoverState::ConfirmingMulti || hoverState_ == HoverState::PlayingMulti) &&
+            now - lastSelectionValidationTick_ >= 500) {
+            lastSelectionValidationTick_ = now;
+            ValidateExplorerContext();
+            if (hoverState_ == HoverState::Idle && !multiConfirm_.IsVisible()) return;
+        }
+
+        if (multiConfirm_.IsVisible() &&
+            (multiConfirm_.ContainsScreenPoint(pt) ||
+             PointInTransferBridge(hoverTarget_.itemRect, multiConfirm_.WindowRect(), pt))) {
+            hoverLeaveTick_ = 0;
+            EnsureHoverMonitor();
+            return;
+        }
+        if ((hoverState_ == HoverState::PlayingSingle || hoverState_ == HoverState::PlayingMulti) &&
+            settings_.allowPointerOverPreview &&
+            (CursorInsideAnyPreview(pt) || CursorInPreviewTransferCorridor(pt))) {
+            hoverLeaveTick_ = 0;
+            EnsureHoverMonitor();
+            return;
+        }
+
+        HWND explorerRoot = nullptr;
+        if (explorerForeground) explorerRoot = GetAncestor(fg, GA_ROOT);
+        else if (appInteractionForeground && currentExplorerRoot_ && IsWindow(currentExplorerRoot_)) explorerRoot = currentExplorerRoot_;
+        if (!explorerRoot) {
+            HandleNoHoverTarget(L"Explorer is not foreground");
+            return;
+        }
+
+        // Avoid a UI Automation + Shell enumeration for every mouse packet. A
+        // cached item is valid for 500 ms; unresolved/small movements are sampled
+        // at most every 100 ms. This bounds CPU usage without delaying hover leave
+        // beyond the required 100 ms window.
+        const std::int64_t dx = lastFullResolvePointKnown_ ?
+            static_cast<std::int64_t>(pt.x) - lastFullResolvePoint_.x : 1000;
+        const std::int64_t dy = lastFullResolvePointKnown_ ?
+            static_cast<std::int64_t>(pt.y) - lastFullResolvePoint_.y : 1000;
+        const bool tinyMove = (dx * dx + dy * dy) <= 16;
+        if (!forceResolve && !forceHoverResolve_ && lastFullResolvePointKnown_ &&
+            now - lastFullResolveTick_ < 100 && tinyMove &&
+            !(hoverTarget_.IsValid() && PointInRect(hoverTarget_.itemRect, pt))) {
+            return;
+        }
+
+        bool mayUseCache = hoverTarget_.IsValid() && hoverTarget_.explorerRoot == explorerRoot &&
+            PointInRect(hoverTarget_.itemRect, pt) && !forceResolve && !forceHoverResolve_ &&
+            now - lastFullResolveTick_ < 500;
+        HoverTarget resolved;
+        bool hasTarget = false;
+        if (mayUseCache) {
+            resolved = hoverTarget_;
+            hasTarget = true;
+        } else {
+            hasTarget = explorer_.ResolveHoveredItem(explorerRoot, pt, resolved);
+            forceHoverResolve_ = false;
+            lastFullResolveTick_ = now;
+            lastFullResolvePoint_ = pt;
+            lastFullResolvePointKnown_ = true;
+            if (hasTarget) lastSuccessfulResolveTick_ = now;
+        }
+
+        // UI Automation can transiently return no element while Explorer redraws a
+        // thumbnail. If the pointer is still inside the last confirmed item rect,
+        // retain that exact path briefly instead of cancelling/reopening the preview.
+        if (!hasTarget && hoverTarget_.IsValid() && hoverTarget_.explorerRoot == explorerRoot &&
+            PointInRect(hoverTarget_.itemRect, pt) && now - lastSuccessfulResolveTick_ < 1000) {
+            resolved = hoverTarget_;
+            hasTarget = true;
+        }
+
+        if (!hasTarget) {
+            HandleNoHoverTarget(L"pointer left Explorer media item");
+            return;
+        }
+
+        if (!hoverTarget_.IsValid()) {
+            BeginHover(resolved);
+            return;
+        }
+
+        if (!SameTarget(hoverTarget_, resolved) && hoverState_ == HoverState::Idle &&
+            confirmationRequiresLeave_ && resolved.explorerRoot == currentExplorerRoot_ &&
+            resolved.tabKey == currentTabKey_ && PathInMedia(resolved.path, pendingMultiMedia_)) {
+            // Cancellation suppression belongs to the whole selected set, not to a
+            // single selected item. Moving among selected items must not show the
+            // same confirmation again.
+            hoverTarget_ = resolved;
+            hoverLeaveTick_ = 0;
+            return;
+        }
+
+        if (!SameTarget(hoverTarget_, resolved) &&
+            (hoverState_ == HoverState::PlayingMulti || hoverState_ == HoverState::ConfirmingMulti) &&
+            resolved.explorerRoot == currentExplorerRoot_ && resolved.tabKey == currentTabKey_ &&
+            PathInMedia(resolved.path, hoverState_ == HoverState::PlayingMulti ? playingMedia_ : pendingMultiMedia_)) {
+            hoverTarget_ = resolved;
+            hoverLeaveTick_ = 0;
+            return;
+        }
+
+        if (!SameTarget(hoverTarget_, resolved)) {
+            Log(L"hover target changed: " + hoverTarget_.path + L" -> " + resolved.path);
+            if (hoverState_ == HoverState::PlayingSingle || hoverState_ == HoverState::PlayingMulti) {
+                ClosePreview(PreviewCloseReason::HoverTargetChanged);
+            } else if (hoverState_ == HoverState::ConfirmingMulti) {
+                multiConfirm_.Hide();
+                Log(L"multi confirmation cancelled: hover target changed");
+                hoverState_ = HoverState::Idle;
+            } else {
+                CancelHoverWait(L"hover target changed");
+            }
+            confirmationRequiresLeave_ = false;
+            suppressedConfirmationKey_.clear();
+            BeginHover(resolved);
+            return;
+        }
+
+        hoverTarget_.itemRect = resolved.itemRect;
+        hoverLeaveTick_ = 0;
+
+        if (hoverState_ == HoverState::Idle) {
+            if (confirmationRequiresLeave_ && pendingSelectionKey_ == suppressedConfirmationKey_) return;
+            BeginHover(resolved);
+            return;
+        }
+        if (hoverState_ == HoverState::WaitingSingle || hoverState_ == HoverState::WaitingMulti) {
+            if (now - hoverStartTick_ >= (ULONGLONG)settings_.hoverPreviewDelayMs) CompleteHoverWait();
+            return;
+        }
+        if (hoverState_ == HoverState::PlayingMulti && now >= exitGraceUntil_ &&
+            !PathInMedia(resolved.path, playingMedia_)) {
+            ClosePreview(PreviewCloseReason::HoverTargetChanged);
+            BeginHover(resolved);
+        }
+    }
+
+    void HandleNoHoverTarget(const std::wstring& reason) {
+        ULONGLONG now = GetTickCount64();
+        if (confirmationRequiresLeave_) {
+            confirmationRequiresLeave_ = false;
+            suppressedConfirmationKey_.clear();
+        }
+        if (hoverState_ == HoverState::WaitingSingle || hoverState_ == HoverState::WaitingMulti) {
+            Log(L"hover target left: " + hoverTarget_.path);
+            CancelHoverWait(reason);
+            return;
+        }
+        if (hoverState_ == HoverState::ConfirmingMulti) {
+            // Allow the pointer to cross the small gap between the Explorer item
+            // and the non-modal confirmation window without cancelling it.
+            if (now < confirmMoveGraceUntil_) return;
+            multiConfirm_.Hide();
+            Log(L"multi confirmation cancelled: hover target left");
+            hoverState_ = HoverState::Idle;
+            ResetHoverTarget();
+            return;
+        }
+        if (hoverState_ == HoverState::Idle) {
+            ResetHoverTarget();
+            return;
+        }
+        if (hoverState_ == HoverState::PlayingSingle || hoverState_ == HoverState::PlayingMulti) {
+            if (now < exitGraceUntil_) return;
+            if (!settings_.stopImmediatelyOnHoverLeave) {
+                if (hoverLeaveTick_ == 0) hoverLeaveTick_ = now;
+                if (now - hoverLeaveTick_ < 450) return;
+            }
+            // stopImmediatelyOnHoverLeave closes on the first confirmed sample.
+            // Resolution is sampled at 50-100 ms, so this stays within the target
+            // response time without a distance-based heuristic.
+            Log(L"hover target left: " + hoverTarget_.path);
+            ClosePreview(PreviewCloseReason::HoverLeft);
+        }
+    }
+
+    void CompleteHoverWait() {
+        if (!hoverTarget_.IsValid()) return;
+        if (hoverState_ == HoverState::WaitingSingle) {
+            OpenSingleHoverPreview();
+            return;
+        }
+        if (hoverState_ == HoverState::WaitingMulti) {
+            std::wstring currentKey;
+            std::wstring tabKey;
+            auto selectedMedia = ReadSelectedMedia(hoverTarget_.explorerRoot, currentKey, &tabKey);
+            if (currentKey.empty() || currentKey != pendingSelectionKey_ || tabKey != hoverTarget_.tabKey ||
+                !PathInMedia(hoverTarget_.path, selectedMedia)) {
+                CancelHoverWait(L"multiple selection changed during hover wait");
+                return;
+            }
+            pendingMultiMedia_ = std::move(selectedMedia);
+            if (settings_.confirmMultipleSelection) ShowMultiConfirmation();
+            else AcceptMultiConfirmation();
+        }
+    }
+
+    void OpenSingleHoverPreview() {
+        if (!hoverTarget_.IsValid()) return;
+        HoverTarget target = hoverTarget_;
+        ClosePreview(PreviewCloseReason::Reload);
+        hoverTarget_ = target;
+        currentExplorerRoot_ = target.explorerRoot;
+        currentTabKey_ = target.tabKey;
+        Log(L"hover preview opened: " + target.path);
+        if (preview_.ShowPathNearItem(target.path, target.kind, target.itemRect, latestMousePoint_)) {
+            previewTrigger_ = PreviewTrigger::HoverSingle;
+            hoverState_ = HoverState::PlayingSingle;
+            playingMedia_ = { { target.path, target.kind } };
+            currentExplorerRoot_ = target.explorerRoot;
+            currentTabKey_ = target.tabKey;
+            SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 200, nullptr);
+            EnsureHoverMonitor();
+        }
+    }
+
+    void ShowMultiConfirmation() {
+        if (pendingMultiMedia_.size() <= 1) return;
+        if (confirmationRequiresLeave_ && pendingSelectionKey_ == suppressedConfirmationKey_) {
+            hoverState_ = HoverState::Idle;
+            return;
+        }
+        if (multiConfirm_.Show(inst_, hwnd_, (int)std::min<size_t>(pendingMultiMedia_.size(), 9),
+            hoverTarget_.itemRect, settings_.BorderColor())) {
+            hoverState_ = HoverState::ConfirmingMulti;
+            suppressedConfirmationKey_ = pendingSelectionKey_;
+            confirmationRequiresLeave_ = false;
+            confirmMoveGraceUntil_ = GetTickCount64() + 900;
+            Log(L"multi confirmation shown: count=" + std::to_wstring(pendingMultiMedia_.size()));
+            EnsureHoverMonitor();
+        }
+    }
+
+    void AcceptMultiConfirmation() {
+        std::wstring currentKey;
+        std::wstring tabKey;
+        auto selectedMedia = ReadSelectedMedia(hoverTarget_.explorerRoot, currentKey, &tabKey);
+        if (currentKey.empty() || currentKey != pendingSelectionKey_ || tabKey != hoverTarget_.tabKey) {
+            multiConfirm_.Hide();
+            Log(L"multi confirmation cancelled: selection changed before acceptance");
+            hoverState_ = HoverState::Idle;
+            ResetHoverTarget();
+            return;
+        }
+        multiConfirm_.Hide();
+        confirmationRequiresLeave_ = false;
+        confirmMoveGraceUntil_ = 0;
+        suppressedConfirmationKey_.clear();
+        Log(L"multi confirmation accepted: count=" + std::to_wstring(selectedMedia.size()));
+        playingSelectionKey_ = currentKey;
+        playingMedia_ = selectedMedia;
+        ShowMultiple(selectedMedia, hoverTarget_.itemRect);
+        previewTrigger_ = PreviewTrigger::HoverMultiConfirmed;
+        hoverState_ = HoverState::PlayingMulti;
+        exitGraceUntil_ = GetTickCount64() + 500;
+        SetTimer(hwnd_, TIMER_CURSOR_CLOSE, 200, nullptr);
+        EnsureHoverMonitor();
+        if (currentExplorerRoot_) SetForegroundWindow(currentExplorerRoot_);
+    }
+
+    void CancelMultiConfirmation(bool fromUser) {
+        multiConfirm_.Hide();
+        confirmMoveGraceUntil_ = 0;
+        Log(fromUser ? L"multi confirmation cancelled" : L"multi confirmation closed");
+        hoverState_ = HoverState::Idle;
+        suppressedConfirmationKey_ = pendingSelectionKey_;
+        confirmationRequiresLeave_ = true;
+        EnsureHoverMonitor();
+        if (currentExplorerRoot_) SetForegroundWindow(currentExplorerRoot_);
+    }
+
+    void ValidateExplorerContext() {
+        if ((previewTrigger_ == PreviewTrigger::DirectOpen || previewTrigger_ == PreviewTrigger::ExternalHover) || hoverState_ == HoverState::Idle) return;
+        HWND root = currentExplorerRoot_ ? currentExplorerRoot_ : hoverTarget_.explorerRoot;
+        if (!root || !IsWindow(root)) {
+            ClosePreview(PreviewCloseReason::SelectionChanged);
+            return;
+        }
+
+        std::wstring activeTabKey;
+        explorer_.GetSelectedPathsForForeground(root, &activeTabKey, nullptr, false);
+        if (activeTabKey.empty() || (!currentTabKey_.empty() && activeTabKey != currentTabKey_)) {
+            Log(L"Explorer tab changed: expected=" + currentTabKey_ + L" actual=" + activeTabKey);
+            if (hoverState_ == HoverState::WaitingSingle || hoverState_ == HoverState::WaitingMulti) {
+                CancelHoverWait(L"Explorer tab changed");
+            } else {
+                ClosePreview(PreviewCloseReason::SelectionChanged);
+            }
+            return;
+        }
+        ValidateMultiSelection();
+    }
+
+    void ValidateMultiSelection() {
+        if (hoverState_ != HoverState::WaitingMulti && hoverState_ != HoverState::ConfirmingMulti && hoverState_ != HoverState::PlayingMulti) return;
+        HWND root = currentExplorerRoot_ ? currentExplorerRoot_ : hoverTarget_.explorerRoot;
+        if (!root || !IsWindow(root)) {
+            ClosePreview(PreviewCloseReason::SelectionChanged);
+            return;
+        }
+        std::wstring key;
+        std::wstring tabKey;
+        auto media = ReadSelectedMedia(root, key, &tabKey);
+        const std::wstring expected = hoverState_ == HoverState::PlayingMulti ? playingSelectionKey_ : pendingSelectionKey_;
+        if (key.empty() || key != expected || (!currentTabKey_.empty() && tabKey != currentTabKey_)) {
+            multiConfirm_.Hide();
+            Log(L"multiple selection changed");
+            ClosePreview(PreviewCloseReason::SelectionChanged);
+        } else if (hoverState_ != HoverState::PlayingMulti) {
+            pendingMultiMedia_ = std::move(media);
+        }
     }
 
     bool AnyPreviewVisible() const {
@@ -2263,12 +3412,13 @@ private:
         return false;
     }
 
-    bool AllMultiPreviewsAtEnd() const {
-        if (!multiPreviewActive_ || !preview_.IsVisible() || !preview_.IsAtEnd()) return false;
+    bool CursorInPreviewTransferCorridor(POINT pt) const {
+        if (!hoverTarget_.IsValid()) return false;
+        if (preview_.IsVisible() && PointInTransferBridge(hoverTarget_.itemRect, preview_.WindowRect(), pt)) return true;
         for (const auto& w : extraPreviews_) {
-            if (w && w->IsVisible() && !w->IsAtEnd()) return false;
+            if (w && w->IsVisible() && PointInTransferBridge(hoverTarget_.itemRect, w->WindowRect(), pt)) return true;
         }
-        return true;
+        return false;
     }
 
     void CloseExtraPreviews() {
@@ -2276,142 +3426,135 @@ private:
         extraPreviews_.clear();
     }
 
-    void ShowMultiple(const std::vector<std::pair<std::wstring, MediaKind>>& media) {
-        const std::wstring incomingKey = MakeMediaSetKey(media);
-        visibleMediaSetKey_ = incomingKey;
-        ClosePreview(L"multi reload", false);
-        // ClosePreview clears the visible key by design; restore the incoming key for
-        // same-selection suppression after the windows are recreated.
-        visibleMediaSetKey_ = incomingKey;
+    POINT PlaceGridAvoidingRect(const RECT& avoidRect, int gridW, int gridH) const {
+        POINT center{ (avoidRect.left + avoidRect.right) / 2, (avoidRect.top + avoidRect.bottom) / 2 };
+        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(mon, &mi);
+        RECT work = mi.rcWork;
+        const int gap = 14;
+        std::vector<POINT> choices = {
+            { avoidRect.right + gap, avoidRect.top },
+            { avoidRect.left - gridW - gap, avoidRect.top },
+            { avoidRect.left, avoidRect.bottom + gap },
+            { avoidRect.left, avoidRect.top - gridH - gap }
+        };
+        for (POINT p : choices) {
+            RECT r{ p.x, p.y, p.x + gridW, p.y + gridH };
+            if (r.left >= work.left && r.top >= work.top && r.right <= work.right && r.bottom <= work.bottom && !IntersectRects(r, avoidRect)) return p;
+        }
+        const LONG minX = work.left + 8;
+        const LONG maxX = std::max<LONG>(minX, work.right - gridW - 8);
+        const LONG minY = work.top + 8;
+        const LONG maxY = std::max<LONG>(minY, work.bottom - gridH - 8);
+        POINT p{ std::clamp<LONG>(avoidRect.right + gap, minX, maxX),
+            std::clamp<LONG>(avoidRect.top, minY, maxY) };
+        return p;
+    }
+
+    static bool IntersectRects(const RECT& a, const RECT& b) {
+        RECT intersection{};
+        return IntersectRect(&intersection, &a, &b) != FALSE;
+    }
+
+    void ShowMultiple(const std::vector<std::pair<std::wstring, MediaKind>>& media, const RECT& avoidRect) {
+        preview_.Hide();
         CloseExtraPreviews();
-        multiPreviewActive_ = true;
-        allowMouseReturnStart_ = false;
         const size_t maxCount = std::min<size_t>(media.size(), 9);
         const int count = static_cast<int>(maxCount);
-        int cols = 1;
-        if (count <= 1) cols = 1;
-        else if (count <= 3) cols = count;
-        else if (count <= 4) cols = 2;
-        else cols = 3;
+        int cols = count <= 3 ? count : (count <= 4 ? 2 : 3);
+        cols = std::max(1, cols);
         const int rows = (count + cols - 1) / cols;
         const int gap = 12;
         const int cellW = preview_.WindowWidth();
         const int cellH = preview_.WindowHeight();
-
-        POINT cursor = pendingAnchor_;
-        HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{ sizeof(mi) };
-        GetMonitorInfoW(mon, &mi);
-        RECT work = mi.rcWork;
         const int gridW = cols * cellW + (cols - 1) * gap;
         const int gridH = rows * cellH + (rows - 1) * gap;
-        int left = cursor.x + 18;
-        int top = cursor.y + 18;
-        if (left + gridW > work.right) left = work.right - gridW - 8;
-        if (top + gridH > work.bottom) top = work.bottom - gridH - 8;
-        if (left < work.left) left = work.left + 8;
-        if (top < work.top) top = work.top + 8;
-        previewGroupRect_ = { left, top, left + gridW, top + gridH };
+        POINT origin = PlaceGridAvoidingRect(avoidRect, gridW, gridH);
 
         Log(L"multi preview layout: count=" + std::to_wstring(count) + L" cols=" + std::to_wstring(cols) + L" rows=" + std::to_wstring(rows));
         for (size_t i = 0; i < maxCount; ++i) {
-            PreviewWindow* w = nullptr;
-            if (i == 0) {
-                w = &preview_;
-            } else {
+            PreviewWindow* window = nullptr;
+            if (i == 0) window = &preview_;
+            else {
                 auto extra = std::make_unique<PreviewWindow>();
-                if (!extra->Create(inst_, &settings_)) {
-                    Log(L"multi preview: extra window create failed");
-                    continue;
-                }
-                w = extra.get();
+                if (!extra->Create(inst_, &settings_)) continue;
+                window = extra.get();
                 extraPreviews_.push_back(std::move(extra));
             }
             int col = static_cast<int>(i) % cols;
             int row = static_cast<int>(i) / cols;
-            POINT topLeft{ left + col * (cellW + gap), top + row * (cellH + gap) };
-            POINT logicalAnchor{ topLeft.x - 18, topLeft.y - 18 };
-            if (w->ShowPathAt(media[i].first, media[i].second, topLeft, logicalAnchor, true)) {
-                Log(L"multi preview queued paused: " + media[i].first);
-            }
+            POINT topLeft{ origin.x + col * (cellW + gap), origin.y + row * (cellH + gap) };
+            POINT logicalAnchor{ (avoidRect.left + avoidRect.right) / 2, (avoidRect.top + avoidRect.bottom) / 2 };
+            window->ShowPathAt(media[i].first, media[i].second, topLeft, logicalAnchor, true);
         }
-        // Start every mpv instance after all preview windows and files are queued.
-        // This gives actual simultaneous playback instead of only the last window
-        // looking active while earlier windows are still loading.
         preview_.StartPlayback();
         for (auto& w : extraPreviews_) if (w) w->StartPlayback();
         Log(L"multi preview playback started together");
     }
 
-    void ClosePreview(const std::wstring& reason, bool allowReturnReopen = true) {
-        const bool hadMulti = multiPreviewActive_ && AnyPreviewVisible();
-        if (AnyPreviewVisible()) Log(L"preview close: " + reason);
-        visibleMediaSetKey_.clear();
+    void ClosePreview(PreviewCloseReason reason) {
+        const bool closingExternalHover = previewTrigger_ == PreviewTrigger::ExternalHover;
+        if (AnyPreviewVisible() || multiConfirm_.IsVisible()) {
+            Log(L"preview closed: " + PreviewCloseReasonText(reason));
+        }
+        multiConfirm_.Hide();
         preview_.Hide();
         for (auto& w : extraPreviews_) if (w) w->Hide();
-        if (hadMulti && allowReturnReopen &&
-            (reason.find(L"cursor") != std::wstring::npos || reason.find(L"selection") != std::wstring::npos)) {
-            allowMouseReturnStart_ = true;
-            Log(L"multi preview return-reopen armed");
+        playingMedia_.clear();
+        playingSelectionKey_.clear();
+        pendingMultiMedia_.clear();
+        pendingSelectionKey_.clear();
+        confirmationRequiresLeave_ = false;
+        suppressedConfirmationKey_.clear();
+        KillTimer(hwnd_, TIMER_CURSOR_CLOSE);
+        previewTrigger_ = PreviewTrigger::None;
+        if (closingExternalHover) {
+            externalHoverSourcePid_ = 0;
+            externalHoverRequestId_.clear();
         }
-        if (!AnyPreviewVisible()) KillTimer(hwnd_, TIMER_CURSOR_CLOSE);
+        hoverState_ = HoverState::Idle;
+        hoverLeaveTick_ = 0;
+        exitGraceUntil_ = 0;
+        confirmMoveGraceUntil_ = 0;
+        ResetHoverTarget();
     }
 
-    void CheckCursorClose() {
-        if (!AnyPreviewVisible()) { KillTimer(hwnd_, TIMER_CURSOR_CLOSE); return; }
-        preview_.Tick();
-        for (auto& w : extraPreviews_) if (w) w->Tick();
-        if (multiPreviewActive_ && !allowMouseReturnStart_ && AllMultiPreviewsAtEnd()) {
-            allowMouseReturnStart_ = true;
-            Log(L"multi preview ended; return-reopen armed");
-        }
-        POINT pt{};
-        GetCursorPos(&pt);
-        if (CursorInsideAnyPreview(pt)) return;
-
-        if (multiPreviewActive_) {
-            // Multiple windows must not vanish while the pointer is travelling from
-            // the Explorer selection toward one of the tiled previews.  Keep the
-            // group alive while the pointer is near the grid or near the selection
-            // anchor, and close only after it is clearly away from both.
-            const int margin = std::max<int>(220, settings_.cursorFarClosePx);
-            RECT expanded = previewGroupRect_;
-            InflateRect(&expanded, margin, margin);
-            if (PointInRect(expanded, pt)) return;
-            if (std::abs(pt.x - pendingAnchor_.x) <= margin && std::abs(pt.y - pendingAnchor_.y) <= margin) return;
-            ClosePreview(L"cursor moved far from multi preview");
+    void TickPreviewWindows() {
+        if (!AnyPreviewVisible()) {
+            KillTimer(hwnd_, TIMER_CURSOR_CLOSE);
             return;
         }
-
-        POINT a = preview_.IsVisible() ? preview_.Anchor() : pt;
-        if (preview_.IsVisible() && (std::abs(pt.x - a.x) >= settings_.cursorFarClosePx || std::abs(pt.y - a.y) >= settings_.cursorFarClosePx)) {
-            ClosePreview(L"cursor moved far");
-        }
+        preview_.Tick();
+        for (auto& w : extraPreviews_) if (w) w->Tick();
     }
 
     void ToggleEnabled() {
         settings_.enabled = !settings_.enabled;
         settings_.Save();
-        if (!settings_.enabled) ClosePreview(L"disabled");
-        else ScheduleSelectionCheck(L"enabled");
-    }
-
-    void OpenSettingsDialog() {
-        SettingsDialog dlg;
-        if (dlg.Show(inst_, hwnd_, settings_)) {
-            settings_.Save();
-            Log(L"settings updated from dialog");
-            if (AnyPreviewVisible()) ClosePreview(L"settings changed");
+        if (!settings_.enabled) ClosePreview(PreviewCloseReason::Disabled);
+        else if (settings_.hoverPreviewEnabled) {
+            GetCursorPos(&latestMousePoint_);
+            latestMousePointKnown_ = true;
+            forceHoverResolve_ = true;
         }
     }
 
-    void OpenMpvRuntimeFolder() {
-        ShellExecuteW(nullptr, L"open", RuntimeDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    void OpenSettingsDialog() {
+        SettingsDialog dialog;
+        if (dialog.Show(inst_, hwnd_, settings_)) {
+            Log(L"settings updated from dialog");
+            ClosePreview(PreviewCloseReason::SettingsChanged);
+            if (settings_.enabled && settings_.hoverPreviewEnabled) {
+                GetCursorPos(&latestMousePoint_);
+                latestMousePointKnown_ = true;
+                forceHoverResolve_ = true;
+            }
+        }
     }
 
-    void OpenLogsFolder() {
-        ShellExecuteW(nullptr, L"open", LogsDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    }
+    void OpenMpvRuntimeFolder() { ShellExecuteW(nullptr, L"open", RuntimeDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
+    void OpenLogsFolder() { ShellExecuteW(nullptr, L"open", LogsDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
 
     std::wstring MpvTrayTip() const {
         return std::wstring(kAppDisplayName) + (mpvRuntimeReady_ ? L" / mpv ok" : L" / mpv missing");
@@ -2425,85 +3568,147 @@ private:
 
     void ShowAbout() {
         RefreshMpvRuntimeStatus();
-        std::wstring msg = std::wstring(L"MvView v0.20 First Plot\n\n") +
-            L"Explorerで選択した画像・動画・音声を、libmpvで小窓プレビューします。\n\n" +
+        std::wstring msg = std::wstring(kAppDisplayName) + L"\n\n" +
+            L"Explorerのメディア項目をホバーすると、libmpvで小窓プレビューします。\n\n" +
             L"状態: " + mpvRuntimeStatus_ + L"\n\n" +
             L"EXE: " + GetModulePathText() + L"\n" +
             L"mpv runtime: " + RuntimeDir() + L"\n" +
             L"設定: " + SettingsPath() + L"\n" +
             L"ログ: " + LogPath();
-        MessageBoxW(hwnd_, msg.c_str(), L"MvView v0.20 について", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(hwnd_, msg.c_str(), MVVIEW_APP_DISPLAY_NAME_W L" について", MB_OK | MB_ICONINFORMATION);
     }
 
     void ShowHelp() {
         std::wstring msg = std::wstring(L"MvView Help\n\n") +
-            L"基本操作:\n" +
-            L"- Explorerで画像・動画・音声ファイルをクリック選択するとプレビューします。\n" +
-            L"- プレビュー小窓をクリック、またはESCで閉じます。\n" +
-            L"- トレイアイコンを右クリックするとメニューを表示します。\n\n" +
-            L"mpv runtime:\n" +
-            L"- EXE横の mpv-2.dll / libmpv-2.dll を探します。\n" +
-            L"- EXE横の runtime\\mpv-2.dll / runtime\\libmpv-2.dll も探します。\n\n" +
-            L"設定フォルダ:\n" + AppDataDir() + L"\n\n" +
-            L"ログ:\n" + LogPath();
-        MessageBoxW(hwnd_, msg.c_str(), L"MvView v0.20 Help", MB_OK | MB_ICONINFORMATION);
+            L"- Explorerのファイル一覧でメディア項目にカーソルを置くとプレビューします。\n" +
+            L"- クリックや選択変更だけではプレビューを開始しません。\n" +
+            L"- 複数選択時は、選択項目のホバー後に確認画面を表示します。\n" +
+            L"- プレビューをクリックすると一時停止/再生、ホイールでシークします。\n" +
+            L"- Ctrl+ホイールで一時的に表示解像度を変更します。\n" +
+            L"- ESCでプレビューを閉じます。\n\n" +
+            L"設定: " + SettingsPath() + L"\n" +
+            L"ログ: " + LogPath();
+        MessageBoxW(hwnd_, msg.c_str(), MVVIEW_APP_DISPLAY_NAME_W L" Help", MB_OK | MB_ICONINFORMATION);
     }
 
     LRESULT OnCopyData(const COPYDATASTRUCT* cds) {
-        if (!cds || !cds->lpData || cds->cbData < sizeof(wchar_t)) return 0;
-        std::wstring path((const wchar_t*)cds->lpData, (cds->cbData / sizeof(wchar_t)) - 1);
-        OpenExternalPath(path);
+        if (!cds || !cds->lpData || cds->cbData < sizeof(wchar_t) || (cds->cbData % sizeof(wchar_t)) != 0) return 0;
+        const size_t chars = cds->cbData / sizeof(wchar_t);
+        const wchar_t* data = static_cast<const wchar_t*>(cds->lpData);
+        std::wstring text(data, chars > 0 && data[chars-1] == L'\0' ? chars-1 : chars);
+        if (cds->dwData == 1) { OpenExternalPath(text); return 1; }
+        if (cds->dwData != MVVIEW_HOVER_COPYDATA_ID) return 0;
+        ExternalHoverRequest request; std::wstring error;
+        if (!ParseExternalHoverJson(text, request, error)) { Log(L"external hover rejected: " + error); return 0; }
+        if (request.action == L"hover_open" || request.action == L"hover_update") OpenExternalHover(request);
+        else if (request.action == L"hover_close") CloseExternalHover(request);
+        else if (request.action == L"hover_move") MoveExternalHover(request);
         return 1;
+    }
+
+    void HandleMouseEvent(WPARAM eventType, LPARAM packedPoint) {
+        POINT pt = UnpackScreenPoint(packedPoint);
+        latestMousePoint_ = pt;
+        latestMousePointKnown_ = true;
+        if (eventType == WM_MOUSEMOVE) {
+            ProcessHoverSample(pt, false);
+        } else {
+            // Clicks and selection changes invalidate cached Shell/UIA data but do
+            // not start hover preview by themselves. They do validate the active
+            // Explorer tab/selection so an existing preview stops on a tab switch.
+            forceHoverResolve_ = true;
+            if (hoverState_ != HoverState::Idle && (previewTrigger_ != PreviewTrigger::DirectOpen && previewTrigger_ != PreviewTrigger::ExternalHover)) {
+                KillTimer(hwnd_, TIMER_SELECTION_VALIDATE);
+                SetTimer(hwnd_, TIMER_SELECTION_VALIDATE, 60, nullptr);
+            }
+        }
+    }
+
+    void HandleForegroundEvent(HWND eventHwnd) {
+        if ((previewTrigger_ == PreviewTrigger::DirectOpen || previewTrigger_ == PreviewTrigger::ExternalHover)) return;
+        HWND fg = eventHwnd ? GetAncestor(eventHwnd, GA_ROOT) : GetForegroundWindow();
+        if (explorer_.IsExplorerWindow(fg)) {
+            // Foreground/focus events invalidate the tab cache but never start a
+            // preview by themselves. The next mouse movement performs resolution.
+            forceHoverResolve_ = true;
+            return;
+        }
+        if (IsAppInteractionWindow(fg)) return;
+        if (settings_.closeWhenForegroundLost) ClosePreview(PreviewCloseReason::ForegroundLost);
+        else if (hoverState_ == HoverState::ConfirmingMulti) {
+            multiConfirm_.Hide();
+            Log(L"multi confirmation cancelled: foreground lost");
+            hoverState_ = HoverState::Idle;
+            ResetHoverTarget();
+        } else CancelHoverWait(L"foreground lost");
     }
 
     LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (taskbarCreatedMsg_ && msg == taskbarCreatedMsg_) {
-            Log(L"TaskbarCreated received; re-adding tray icon");
             tray_.Add(hwnd_, inst_, MpvTrayTip());
             tray_.UpdateTip(MpvTrayTip());
             return 0;
         }
-
         switch (msg) {
         case WM_MV_HOOK_EVENT:
-            if (wp == EVENT_SYSTEM_FOREGROUND) {
-                HWND eventHwnd = reinterpret_cast<HWND>(lp);
-                if (!explorer_.IsExplorerWindow(eventHwnd)) {
-                    if (settings_.closeWhenForegroundLost && AnyPreviewVisible()) ClosePreview(L"foreground lost");
-                } else {
-                    Log(L"foreground Explorer event observed; no preview start");
+            if (wp == EVENT_SYSTEM_FOREGROUND) HandleForegroundEvent(reinterpret_cast<HWND>(lp));
+            else {
+                forceHoverResolve_ = true;
+                if (hoverState_ != HoverState::Idle && (previewTrigger_ != PreviewTrigger::DirectOpen && previewTrigger_ != PreviewTrigger::ExternalHover)) {
+                    KillTimer(hwnd_, TIMER_SELECTION_VALIDATE);
+                    SetTimer(hwnd_, TIMER_SELECTION_VALIDATE, 60, nullptr);
+                } else if (confirmationRequiresLeave_ && currentExplorerRoot_) {
+                    // A changed selection is a new confirmation context even when the
+                    // pointer has not yet left the old item. Do not start here; only
+                    // release the old suppression key.
+                    std::wstring newKey;
+                    std::wstring newTab;
+                    ReadSelectedMedia(currentExplorerRoot_, newKey, &newTab);
+                    if (newKey != suppressedConfirmationKey_ || newTab != currentTabKey_) {
+                        confirmationRequiresLeave_ = false;
+                        suppressedConfirmationKey_.clear();
+                        pendingSelectionKey_.clear();
+                    }
                 }
-            } else if (wp == EVENT_OBJECT_FOCUS_VALUE || wp == EVENT_OBJECT_SELECTION_VALUE || wp == EVENT_OBJECT_SELECTIONADD_VALUE || wp == EVENT_OBJECT_SELECTIONREMOVE_VALUE || wp == EVENT_OBJECT_SELECTIONWITHIN_VALUE) {
-                ScheduleSelectionCheck(L"selection/focus event");
             }
             return 0;
         case WM_MV_MOUSE_EVENT:
-            if (wp == WM_MOUSEMOVE) ScheduleSelectionCheck(L"mouse move return event");
-            else ScheduleSelectionCheck(L"mouse click event");
+            HandleMouseEvent(wp, lp);
+            return 0;
+        case WM_MV_MULTI_CONFIRM:
+            if (wp) AcceptMultiConfirmation();
+            else CancelMultiConfirmation(true);
             return 0;
         case WM_TIMER:
-            if (wp == TIMER_DEBOUNCE) { CheckSelectionNow(); return 0; }
-            if (wp == TIMER_CURSOR_CLOSE) { CheckCursorClose(); return 0; }
+            if (wp == TIMER_HOVER_MONITOR) {
+                POINT pt{};
+                GetCursorPos(&pt);
+                ProcessHoverSample(pt, false);
+                return 0;
+            }
+            if (wp == TIMER_CURSOR_CLOSE) { TickPreviewWindows(); return 0; }
+            if (wp == TIMER_SELECTION_VALIDATE) {
+                KillTimer(hwnd_, TIMER_SELECTION_VALIDATE);
+                ValidateExplorerContext();
+                return 0;
+            }
             return 0;
         case WM_HOTKEY:
-            if (wp == HOTKEY_ESCAPE) { ClosePreview(L"escape"); return 0; }
+            if (wp == HOTKEY_ESCAPE) { ClosePreview(PreviewCloseReason::Escape); return 0; }
             return 0;
         case WM_TRAYICON: {
             const UINT trayEvent = LOWORD(lp);
-            Log(L"TrayIcon: event=" + std::to_wstring(trayEvent));
-
             if (trayEvent == WM_RBUTTONDOWN || trayEvent == WM_RBUTTONUP || trayEvent == WM_CONTEXTMENU) {
                 tray_.ShowMenu(settings_, AnyPreviewVisible());
             } else if (trayEvent == WM_LBUTTONUP || trayEvent == NIN_SELECT || trayEvent == NIN_KEYSELECT) {
-                if (AnyPreviewVisible()) ClosePreview(L"tray left click");
-                else ScheduleSelectionCheck(L"tray left click");
+                if (AnyPreviewVisible() || multiConfirm_.IsVisible()) ClosePreview(PreviewCloseReason::TrayCommand);
             }
             return 0;
         }
         case WM_COMMAND:
             switch (LOWORD(wp)) {
             case CMD_TRAY_ENABLED: ToggleEnabled(); break;
-            case CMD_TRAY_CLOSE_PREVIEW: ClosePreview(L"tray command"); break;
+            case CMD_TRAY_CLOSE_PREVIEW: ClosePreview(PreviewCloseReason::TrayCommand); break;
             case CMD_TRAY_OPEN_SETTINGS: OpenSettingsDialog(); break;
             case CMD_TRAY_OPEN_MPV_RUNTIME: OpenMpvRuntimeFolder(); break;
             case CMD_TRAY_OPEN_LOGS: OpenLogsFolder(); break;
@@ -2518,6 +3723,7 @@ private:
         case WM_COPYDATA:
             return OnCopyData(reinterpret_cast<COPYDATASTRUCT*>(lp));
         case WM_DESTROY:
+            gHookTargetWindow = nullptr;
             PostQuitMessage(0);
             return 0;
         default:
@@ -2533,15 +3739,14 @@ private:
             if (self) {
                 self->hwnd_ = hwnd;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-                Log(L"Main WndProc: WM_NCCREATE accepted");
                 return TRUE;
             }
             return FALSE;
         }
-        if (self) return self->HandleMessage(hwnd, msg, wp, lp);
-        return DefWindowProcW(hwnd, msg, wp, lp);
+        return self ? self->HandleMessage(hwnd, msg, wp, lp) : DefWindowProcW(hwnd, msg, wp, lp);
     }
 };
+
 
 std::wstring GetArgValue(int argc, wchar_t** argv, const std::wstring& key) {
     for (int i = 1; i < argc; ++i) {
@@ -2595,13 +3800,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
             if (!openPath.empty()) {
                 if (!SendOpenPathToExisting(openPath)) {
                     MessageBoxW(nullptr, L"MvView is already running, but the main window was not found.\n\nPlease run:\nGet-Process MvView -ErrorAction SilentlyContinue | Stop-Process -Force",
-                        L"MvView v0.20 already running", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                        MVVIEW_APP_DISPLAY_NAME_W L" already running", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
                 }
             } else if (existing) {
                 PostMessageW(existing, WM_MV_SHOW_STATUS, 0, 0);
             } else {
                 MessageBoxW(nullptr, L"MvView mutex already exists, but the tray/main window was not found.\n\nAn old hidden process may be running. Please run:\nGet-Process MvView -ErrorAction SilentlyContinue | Stop-Process -Force",
-                    L"MvView v0.20 hidden instance", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                    MVVIEW_APP_DISPLAY_NAME_W L" hidden instance", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
             }
             if (argv) LocalFree(argv);
             CloseHandle(mutex);

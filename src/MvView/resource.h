@@ -1,8 +1,5 @@
 #pragma once
-#define IDI_APP 101
+#include "version_generated.h"
 
-#define MVVIEW_VERSION_MAJOR 0
-#define MVVIEW_VERSION_MINOR 20
-#define MVVIEW_VERSION_PATCH 0
-#define MVVIEW_VERSION_BUILD 0
-#define MVVIEW_VERSION_TEXT "0.20"
+#define IDI_APP 101
+#define IDB_SPLASH 102

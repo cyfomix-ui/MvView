@@ -2,6 +2,7 @@
 #include <windows.h>
 
 IDI_APP ICON "Assets\\MvView.ico"
+IDB_SPLASH BITMAP "Assets\\MvViewSplash.bmp"
 
 
 VS_VERSION_INFO VERSIONINFO
@@ -22,7 +23,7 @@ BEGIN
         BLOCK "041104b0"
         BEGIN
             VALUE "CompanyName", "MvSuite Project\0"
-            VALUE "FileDescription", "MvView Explorer Media Preview\0"
+            VALUE "FileDescription", "MvView Explorer Media Hover Preview\0"
             VALUE "FileVersion", MVVIEW_VERSION_TEXT "\0"
             VALUE "InternalName", "MvView.exe\0"
             VALUE "OriginalFilename", "MvView.exe\0"

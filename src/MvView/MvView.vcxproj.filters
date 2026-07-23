@@ -11,6 +11,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="version_generated.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="MvView.rc"><Filter>Resource Files</Filter></ResourceCompile>
@@ -21,5 +22,18 @@
     <Image Include="Assets\MvViewIcon.png"><Filter>Assets</Filter></Image>
     <Image Include="Assets\MvViewLogo.png"><Filter>Assets</Filter></Image>
     <Image Include="Assets\MvViewSplash.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewSplash.bmp"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewTray.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_Source.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_Master.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewSplash_Master.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_16.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_32.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_48.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_64.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_128.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_256.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_512.png"><Filter>Assets</Filter></Image>
+    <Image Include="Assets\MvViewIcon_1024.png"><Filter>Assets</Filter></Image>
   </ItemGroup>
 </Project>
