@@ -135,9 +135,6 @@ if ($Publish) {
     New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 
     Copy-Item (Join-Path $outDir 'MvView.exe') $publishDir -Force
-    if (Test-Path (Join-Path $outDir 'MvView.pdb')) {
-        Copy-Item (Join-Path $outDir 'MvView.pdb') $publishDir -Force
-    }
     if ($runtimeHasMpv) {
         $publishRuntime = Join-Path $publishDir 'runtime'
         New-Item -ItemType Directory -Path $publishRuntime -Force | Out-Null
@@ -146,6 +143,10 @@ if ($Publish) {
         }
     }
     Copy-Item (Join-Path $root 'README.md') $publishDir -Force
+    Copy-Item (Join-Path $root 'README.en.md') $publishDir -Force
+    $publishImages = Join-Path $publishDir 'docs\images'
+    New-Item -ItemType Directory -Path $publishImages -Force | Out-Null
+    Copy-Item (Join-Path $root 'docs\images\MvView_Title.png') $publishImages -Force
     Copy-Item $versionXmlPath $publishDir -Force
 
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'

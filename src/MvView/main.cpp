@@ -35,6 +35,7 @@
 #include <commctrl.h>
 #include <objbase.h>
 #include <strsafe.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -60,6 +61,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uiautomationcore.lib")
+#pragma comment(lib, "winhttp.lib")
 
 #include "resource.h"
 
@@ -92,11 +94,45 @@ constexpr UINT WM_MPV_WAKEUP = WM_APP + 22;
 constexpr UINT WM_MV_SHOW_STATUS = WM_APP + 23;
 constexpr UINT WM_MV_MOUSE_EVENT = WM_APP + 24;
 constexpr UINT WM_MV_MULTI_CONFIRM = WM_APP + 25;
+constexpr UINT WM_MV_UPDATE_AVAILABLE = WM_APP + 26;
 constexpr UINT TIMER_CURSOR_CLOSE = 1002; // preview progress tick
 constexpr UINT TIMER_HOVER_MONITOR = 1003;
 constexpr UINT TIMER_SELECTION_VALIDATE = 1004;
 constexpr UINT HOTKEY_ESCAPE = 4101;
 constexpr int TRAY_UID = 1;
+constexpr wchar_t kLatestReleaseApiHost[] = L"api.github.com";
+constexpr wchar_t kLatestReleaseApiPath[] = L"/repos/cyfomix-ui/MvView/releases/latest";
+
+struct UpdateInfo {
+    std::wstring version;
+    std::wstring downloadUrl;
+};
+
+std::vector<int> ParseVersionParts(std::wstring version) {
+    while (!version.empty() && (version.front() == L'v' || version.front() == L'V' || iswspace(version.front()))) {
+        version.erase(version.begin());
+    }
+    std::vector<int> parts;
+    std::wstringstream stream(version);
+    std::wstring part;
+    while (std::getline(stream, part, L'.')) {
+        wchar_t* end = nullptr;
+        long value = wcstol(part.c_str(), &end, 10);
+        if (end == part.c_str()) return {};
+        parts.push_back(static_cast<int>(value));
+    }
+    return parts;
+}
+
+bool IsNewerVersion(const std::wstring& candidate, const std::wstring& current) {
+    auto left = ParseVersionParts(candidate);
+    auto right = ParseVersionParts(current);
+    if (left.empty() || right.empty()) return false;
+    const size_t count = std::max(left.size(), right.size());
+    left.resize(count);
+    right.resize(count);
+    return left > right;
+}
 
 // Hook callbacks run outside the application message dispatch. Keep them minimal:
 // they only post the event and full 32-bit screen coordinates to this window.
@@ -2754,6 +2790,7 @@ public:
         Log(L"runtime status: " + mpvRuntimeStatus_);
         tray_.UpdateTip(MpvTrayTip());
         InstallHooks();
+        BeginUpdateCheck();
 
         if (!initialOpenPath.empty()) {
             OpenExternalPath(initialOpenPath);
@@ -2854,6 +2891,103 @@ public:
     }
 
 private:
+    static DWORD WINAPI CheckForUpdatesThread(void* parameter) {
+        HWND target = static_cast<HWND>(parameter);
+        HINTERNET session = WinHttpOpen(L"MvView/" MVVIEW_VERSION_TEXT_W,
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) return 0;
+        WinHttpSetTimeouts(session, 5000, 5000, 5000, 10000);
+
+        HINTERNET connection = WinHttpConnect(session, kLatestReleaseApiHost,
+            INTERNET_DEFAULT_HTTPS_PORT, 0);
+        HINTERNET request = connection
+            ? WinHttpOpenRequest(connection, L"GET", kLatestReleaseApiPath, nullptr,
+                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
+            : nullptr;
+        std::wstring response;
+        if (request) {
+            const wchar_t headers[] =
+                L"Accept: application/vnd.github+json\r\n"
+                L"X-GitHub-Api-Version: 2022-11-28\r\n";
+            if (WinHttpSendRequest(request, headers, static_cast<DWORD>(-1L),
+                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(request, nullptr)) {
+                DWORD status = 0;
+                DWORD statusSize = sizeof(status);
+                WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+                if (status == 200) {
+                    std::string bytes;
+                    for (;;) {
+                        DWORD available = 0;
+                        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+                        const size_t oldSize = bytes.size();
+                        bytes.resize(oldSize + available);
+                        DWORD read = 0;
+                        if (!WinHttpReadData(request, bytes.data() + oldSize, available, &read)) break;
+                        bytes.resize(oldSize + read);
+                        if (read == 0) break;
+                    }
+                    response = Utf8ToWide(bytes);
+                }
+            }
+        }
+        if (request) WinHttpCloseHandle(request);
+        if (connection) WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+
+        std::wstring tag;
+        std::wstring url;
+        if (!response.empty() && JsonString(response, L"tag_name", tag) &&
+            IsNewerVersion(tag, kAppVersion)) {
+            if (!JsonString(response, L"browser_download_url", url)) {
+                JsonString(response, L"html_url", url);
+            }
+            if (!url.empty()) {
+                auto* info = new UpdateInfo{tag, url};
+                if (!IsWindow(target) || !PostMessageW(target, WM_MV_UPDATE_AVAILABLE, 0,
+                        reinterpret_cast<LPARAM>(info))) {
+                    delete info;
+                }
+            }
+        }
+        return 0;
+    }
+
+    void BeginUpdateCheck() {
+        HANDLE thread = CreateThread(nullptr, 0, CheckForUpdatesThread, hwnd_, 0, nullptr);
+        if (thread) CloseHandle(thread);
+        else Log(L"update check thread could not be started");
+    }
+
+    void ShowUpdateDialog(UpdateInfo* info) {
+        std::unique_ptr<UpdateInfo> owned(info);
+        if (!owned) return;
+        const std::wstring message = L"新しいバージョン " + owned->version +
+            L" が GitHub で公開されています。\n現在のバージョン: v" + kAppVersion;
+        TASKDIALOG_BUTTON buttons[] = {
+            { 100, L"Download" },
+            { IDCANCEL, L"後で" }
+        };
+        TASKDIALOGCONFIG config{};
+        config.cbSize = sizeof(config);
+        config.hwndParent = hwnd_;
+        config.hInstance = inst_;
+        config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
+        config.pszWindowTitle = L"MvView Update";
+        config.pszMainIcon = TD_INFORMATION_ICON;
+        config.pszMainInstruction = L"MvView の更新があります";
+        config.pszContent = message.c_str();
+        config.cButtons = ARRAYSIZE(buttons);
+        config.pButtons = buttons;
+        config.nDefaultButton = 100;
+        int selected = IDCANCEL;
+        if (SUCCEEDED(TaskDialogIndirect(&config, &selected, nullptr, nullptr)) && selected == 100) {
+            ShellExecuteW(hwnd_, L"open", owned->downloadUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+
     bool CreateMainWindow() {
         WNDCLASSW cls{};
         cls.lpfnWndProc = MvViewApp::WndProc;
@@ -3678,6 +3812,9 @@ private:
         case WM_MV_MULTI_CONFIRM:
             if (wp) AcceptMultiConfirmation();
             else CancelMultiConfirmation(true);
+            return 0;
+        case WM_MV_UPDATE_AVAILABLE:
+            ShowUpdateDialog(reinterpret_cast<UpdateInfo*>(lp));
             return 0;
         case WM_TIMER:
             if (wp == TIMER_HOVER_MONITOR) {
