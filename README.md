@@ -1,17 +1,22 @@
-# MvView v0.26
+# MvView v0.30
 
 [English](README.en.md)
 
 ![MvViewでExplorerのメディアをプレビュー](docs/images/MvView_Title.png)
 
+![複数メディアのプレビュー](docs/images/MvView03.png)
+
+*複数メディアのプレビュー*
+
 MvView は、Windows 11 Explorer のファイル一覧でメディア項目へカーソルを置くと、libmpv を使って画像・動画・音声を小窓プレビューする C++ / Win32 常駐アプリです。
 
-## v0.26 の変更点
+## v0.30 の変更点
 
-- 起動時に GitHub Releases の最新版を確認
-- 新しい版がある場合はダイアログを表示し、［Download］から最新 Release の配布ファイルを開けるようにしました
-- README の日本語版・英語版を分離し、相互に切り替えられるようにしました
-- タイトル付近に動作イメージを追加
+- 設定ダイアログへ「Preview 位置」を追加
+- 「左上」「右上」「中央」「左下」「右下」から表示位置を選択可能
+- 単体プレビューと最大9件の複数タイルプレビューの両方へ設定位置を反映
+- 各表示位置はマウスカーソルを基準とし、画面外へ出る場合だけ現在のモニターの作業領域内へ補正
+- 既存設定ファイルでは、初期値として従来の見え方に近い「右上」を使用
 
 ## 主な機能
 
@@ -19,7 +24,7 @@ MvView は、Windows 11 Explorer のファイル一覧でメディア項目へ�
 - UI Automation と Shell View の両方を使い、完全なファイルパスを安全に特定
 - 画像、動画、音声を libmpv でプレビュー
 - Ctrl / Shift による複数選択は確認後に最大9件をタイル表示
-- 対象から離れたときの自動終了、プレビュー上へのポインター移動、待機時間などを設定可能
+- 対象から離れたときの自動終了、プレビュー上へのポインター移動、待機時間、Preview位置などを設定可能
 - `--open` と世代管理付き UTF-16 JSON `WM_COPYDATA` Hover IPC に対応
 - GitHub Releases の更新通知に対応
 
@@ -67,6 +72,7 @@ MvView は、Windows 11 Explorer のファイル一覧でメディア項目へ�
 - プレビュー開始時の音声
 - Preview 解像度
 - プレビュー枠色
+- Preview 位置
 
 ## DirectOpen
 
@@ -85,6 +91,17 @@ MvView.exe --open "D:\media\sample.mp4"
 プロトコル `mvview-hover` version `1` は `hover_open`、`hover_update`、`hover_move`、`hover_close` を提供します。リクエストは `source_pid`、`request_id`、単調増加する `generation` を含み、古いリクエストは無視されます。
 
 ## libmpv
+
+### インストール
+
+MvView は 64-bit 版の libmpv を使用します。
+
+1. [mpv公式のWindows向けインストール案内](https://mpv.io/installation/)から、案内先の [shinchiro Windows builds](https://github.com/shinchiro/mpv-winbuild-cmake/releases/latest) を開きます。
+2. 最新ReleaseのAssetsから `mpv-dev-x86_64-...7z` をダウンロードします。`x86_64-v3`版は新しいCPU向けのため、判断に迷う場合は通常の`x86_64`版を選んでください。
+3. [7-Zip](https://www.7-zip.org/)などで展開し、含まれている `mpv-2.dll` を `MvView.exe` と同じフォルダーへコピーします。
+4. `MvView.exe` を起動し、メディアをプレビューできることを確認します。
+
+配布物によってDLL名が `libmpv-2.dll` の場合は、その名前のまま配置できます。DLLは信頼できる配布元から取得し、32-bit（`i686`）版は使用しないでください。
 
 次の順に DLL を検索します。
 
@@ -116,8 +133,8 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 
 ```text
 bin\x64\Release\MvView.exe
-publish\MvView_v0.26\
-publish\MvView_v0.26_YYYYMMDD_HHMMSS.zip
+publish\MvView_v0.30\
+publish\MvView_v0.30_YYYYMMDD_HHMMSS.zip
 ```
 
 ## 更新確認
@@ -138,6 +155,6 @@ publish\MvView_v0.26_YYYYMMDD_HHMMSS.zip
 
 ## Version 管理
 
-- 現在の Version: `v0.26`
+- 現在の Version: `v0.30`
 - `version.xml` を唯一の Version 元とします。
 - タスクトレイ Tooltip、About、Splash、EXE リソース、配布名へ同じ Version を反映します。

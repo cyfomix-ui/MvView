@@ -2,8 +2,8 @@
 <VersionInfo>
   <AppName>MvView</AppName>
   <ProductName>MvView</ProductName>
-  <Version>0.26</Version>
-  <DisplayVersion>v0.26</DisplayVersion>
-  <BuildDate>2026-07-24</BuildDate>
+  <Version>0.30</Version>
+  <DisplayVersion>v0.30</DisplayVersion>
+  <BuildDate>2026-07-25</BuildDate>
   <Description>Explorer and external application media hover preview</Description>
 </VersionInfo>
