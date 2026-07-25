@@ -147,6 +147,7 @@ if ($Publish) {
     $publishImages = Join-Path $publishDir 'docs\images'
     New-Item -ItemType Directory -Path $publishImages -Force | Out-Null
     Copy-Item (Join-Path $root 'docs\images\MvView_Title.png') $publishImages -Force
+    Copy-Item (Join-Path $root 'docs\images\MvView03.png') $publishImages -Force
     Copy-Item $versionXmlPath $publishDir -Force
 
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
