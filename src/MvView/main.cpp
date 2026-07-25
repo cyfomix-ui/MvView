@@ -652,6 +652,7 @@ struct Settings {
     bool confirmMultipleSelection = true;
     bool allowPointerOverPreview = true;
     int previewResolutionP = 360;
+    int previewPositionIndex = 1; // 0=top-left, 1=top-right, 2=center, 3=bottom-left, 4=bottom-right
     int cursorFarClosePx = 220; // retained for backward-compatible settings files
     bool closeWhenForegroundLost = true;
     bool closeWhenSelectionEmpty = true;
@@ -703,6 +704,7 @@ struct Settings {
         cursorFarClosePx = std::clamp(cursorFarClosePx, 80, 1400);
         volumePercent = std::clamp(volumePercent, 0, 100);
         borderColorIndex = std::clamp(borderColorIndex, 0, 6);
+        previewPositionIndex = std::clamp(previewPositionIndex, 0, 4);
     }
 
     int PreviewContentWidth() const {
@@ -745,6 +747,7 @@ struct Settings {
         confirmMultipleSelection = ReadBool(body, L"confirmMultipleSelection", confirmMultipleSelection);
         allowPointerOverPreview = ReadBool(body, L"allowPointerOverPreview", allowPointerOverPreview);
         previewResolutionP = ReadInt(body, L"previewResolutionP", previewResolutionP);
+        previewPositionIndex = ReadInt(body, L"previewPositionIndex", previewPositionIndex);
         if (previewResolutionP == 360) {
             int oldHeight = ReadInt(body, L"maxPreviewHeight", 0);
             if (oldHeight == 720 || oldHeight == 480 || oldHeight == 360 || oldHeight == 240 || oldHeight == 180) previewResolutionP = oldHeight;
@@ -775,6 +778,7 @@ struct Settings {
         fs << L"  \"confirmMultipleSelection\": " << (confirmMultipleSelection ? L"true" : L"false") << L",\n";
         fs << L"  \"allowPointerOverPreview\": " << (allowPointerOverPreview ? L"true" : L"false") << L",\n";
         fs << L"  \"previewResolutionP\": " << previewResolutionP << L",\n";
+        fs << L"  \"previewPositionIndex\": " << previewPositionIndex << L",\n";
         fs << L"  \"cursorFarClosePx\": " << cursorFarClosePx << L",\n";
         fs << L"  \"closeWhenForegroundLost\": " << (closeWhenForegroundLost ? L"true" : L"false") << L",\n";
         fs << L"  \"closeWhenSelectionEmpty\": " << (closeWhenSelectionEmpty ? L"true" : L"false") << L",\n";
@@ -1618,47 +1622,59 @@ public:
         return wanted;
     }
 
+    POINT CalculateConfiguredTopLeft(POINT cursorPoint, int width, int height) const {
+        HMONITOR mon = MonitorFromPoint(cursorPoint, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(mon, &mi);
+        const RECT work = mi.rcWork;
+        const int screenMargin = 8;
+        const int cursorGap = 16;
+        const int position = settings_ ? std::clamp(settings_->previewPositionIndex, 0, 4) : 1;
+
+        int x = cursorPoint.x + cursorGap;
+        int y = cursorPoint.y - height - cursorGap;
+        switch (position) {
+        case 0: // cursor upper-left
+            x = cursorPoint.x - width - cursorGap;
+            y = cursorPoint.y - height - cursorGap;
+            break;
+        case 1: // cursor upper-right
+            x = cursorPoint.x + cursorGap;
+            y = cursorPoint.y - height - cursorGap;
+            break;
+        case 2: // centered on cursor
+            x = cursorPoint.x - width / 2;
+            y = cursorPoint.y - height / 2;
+            break;
+        case 3: // cursor lower-left
+            x = cursorPoint.x - width - cursorGap;
+            y = cursorPoint.y + cursorGap;
+            break;
+        case 4: // cursor lower-right
+            x = cursorPoint.x + cursorGap;
+            y = cursorPoint.y + cursorGap;
+            break;
+        }
+
+        const int minX = static_cast<int>(work.left) + screenMargin;
+        const int minY = static_cast<int>(work.top) + screenMargin;
+        const int maxX = std::max(minX, static_cast<int>(work.right) - width - screenMargin);
+        const int maxY = std::max(minY, static_cast<int>(work.bottom) - height - screenMargin);
+        return POINT{ std::clamp(x, minX, maxX), std::clamp(y, minY, maxY) };
+    }
+
     bool ShowPath(const std::wstring& path, MediaKind kind, POINT anchor) {
-        int width = WindowWidth();
-        int height = WindowHeight();
-        RECT wanted{ anchor.x + 18, anchor.y + 18, anchor.x + 18 + width, anchor.y + 18 + height };
-        wanted = ClampRectToMonitor(wanted, anchor);
-        POINT topLeft{ wanted.left, wanted.top };
+        POINT topLeft = CalculateConfiguredTopLeft(anchor, WindowWidth(), WindowHeight());
         return ShowPathAt(path, kind, topLeft, anchor);
     }
 
     bool ShowPathNearItem(const std::wstring& path, MediaKind kind, const RECT& itemRect, POINT cursor) {
-        const int width = WindowWidth();
-        const int height = WindowHeight();
-        const int gap = 14;
-        POINT center{ (itemRect.left + itemRect.right) / 2, (itemRect.top + itemRect.bottom) / 2 };
-        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{ sizeof(mi) };
-        GetMonitorInfoW(mon, &mi);
-        const RECT work = mi.rcWork;
-        const POINT candidates[] = {
-            { itemRect.right + gap, itemRect.top },
-            { itemRect.left - width - gap, itemRect.top },
-            { itemRect.left, itemRect.bottom + gap },
-            { itemRect.left, itemRect.top - height - gap }
-        };
-        for (POINT topLeft : candidates) {
-            RECT candidate{ topLeft.x, topLeft.y, topLeft.x + width, topLeft.y + height };
-            RECT intersection{};
-            if (candidate.left >= work.left && candidate.top >= work.top &&
-                candidate.right <= work.right && candidate.bottom <= work.bottom &&
-                !IntersectRect(&intersection, &candidate, &itemRect)) {
-                return ShowPathAt(path, kind, topLeft, cursor);
-            }
-        }
-        RECT fallback{ itemRect.right + gap, itemRect.top, itemRect.right + gap + width, itemRect.top + height };
-        fallback = ClampRectToMonitor(fallback, center);
-        RECT intersection{};
-        if (IntersectRect(&intersection, &fallback, &itemRect)) {
-            fallback.left = std::max<LONG>(work.left + 8, itemRect.left - width - gap);
-            fallback.right = fallback.left + width;
-        }
-        return ShowPathAt(path, kind, POINT{ fallback.left, fallback.top }, cursor);
+        (void)itemRect;
+        POINT topLeft = CalculateConfiguredTopLeft(cursor, WindowWidth(), WindowHeight());
+        Log(L"preview cursor-relative position applied: index=" + std::to_wstring(settings_ ? settings_->previewPositionIndex : 1) +
+            L" cursorX=" + std::to_wstring(cursor.x) + L" cursorY=" + std::to_wstring(cursor.y) +
+            L" x=" + std::to_wstring(topLeft.x) + L" y=" + std::to_wstring(topLeft.y));
+        return ShowPathAt(path, kind, topLeft, cursor);
     }
 
     bool ShowPathAt(const std::wstring& path, MediaKind kind, POINT topLeft, POINT logicalAnchor, bool startPaused = false) {
@@ -2011,6 +2027,7 @@ class SettingsDialog {
         IDC_STOP_ON_LEAVE = 3106,
         IDC_CONFIRM_MULTI = 3107,
         IDC_ALLOW_PREVIEW_POINTER = 3108,
+        IDC_PREVIEW_POSITION = 3109,
         IDC_OK = IDOK,
         IDC_CANCEL = IDCANCEL
     };
@@ -2037,7 +2054,7 @@ public:
         hwnd_ = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             cls.lpszClassName, L"MvView 設定",
             WS_CAPTION | WS_SYSMENU | WS_POPUP,
-            CW_USEDEFAULT, CW_USEDEFAULT, 700, 650,
+            CW_USEDEFAULT, CW_USEDEFAULT, 700, 710,
             owner_, nullptr, inst_, this);
         if (!hwnd_) return false;
         TryEnableDarkModeForWindow(hwnd_);
@@ -2191,13 +2208,19 @@ private:
         for (auto text : colors) SendMessageW(color, CB_ADDSTRING, 0, (LPARAM)text);
         SendMessageW(color, CB_SETCURSEL, settings_->borderColorIndex, 0);
 
+        AddLabel(L"Preview 位置", 28, 426, 190, 30, true);
+        HWND position = AddCombo(IDC_PREVIEW_POSITION, 270, 422, 300, 190);
+        const wchar_t* positions[] = { L"左上", L"右上", L"中央", L"左下", L"右下" };
+        for (auto text : positions) SendMessageW(position, CB_ADDSTRING, 0, (LPARAM)text);
+        SendMessageW(position, CB_SETCURSEL, std::clamp(settings_->previewPositionIndex, 0, 4), 0);
+
         AddLabel(L"Explorer のファイル一覧項目だけを対象にします。クリックや選択変更だけでは開始しません。",
-            28, 438, 620, 58, false);
+            28, 492, 620, 58, false);
 
         HWND ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-            410, 535, 100, 38, hwnd_, (HMENU)(INT_PTR)IDC_OK, inst_, nullptr);
+            410, 595, 100, 38, hwnd_, (HMENU)(INT_PTR)IDC_OK, inst_, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"キャンセル", WS_CHILD | WS_VISIBLE,
-            530, 535, 120, 38, hwnd_, (HMENU)(INT_PTR)IDC_CANCEL, inst_, nullptr);
+            530, 595, 120, 38, hwnd_, (HMENU)(INT_PTR)IDC_CANCEL, inst_, nullptr);
         SendMessageW(ok, WM_SETFONT, (WPARAM)uiFontBold_, TRUE);
         SendMessageW(cancel, WM_SETFONT, (WPARAM)uiFont_, TRUE);
     }
@@ -2222,6 +2245,8 @@ private:
         settings_->previewResolutionP = resValues[sel];
         int colorSel = (int)SendDlgItemMessageW(hwnd_, IDC_COLOR, CB_GETCURSEL, 0, 0);
         settings_->borderColorIndex = std::clamp<int>(colorSel, 0, 6);
+        int positionSel = (int)SendDlgItemMessageW(hwnd_, IDC_PREVIEW_POSITION, CB_GETCURSEL, 0, 0);
+        settings_->previewPositionIndex = std::clamp<int>(positionSel, 0, 4);
         settings_->Clamp();
         settings_->Save();
         applied_ = true;
@@ -2277,17 +2302,34 @@ public:
 
         const int width = 456;
         const int height = 176;
-        POINT center{ (avoidRect.left + avoidRect.right) / 2, (avoidRect.top + avoidRect.bottom) / 2 };
-        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        constexpr int cursorGap = 8;
+        constexpr int workMargin = 8;
+
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) {
+            cursor.x = (avoidRect.left + avoidRect.right) / 2;
+            cursor.y = (avoidRect.top + avoidRect.bottom) / 2;
+        }
+
+        HMONITOR mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfoW(mon, &mi);
-        RECT work = mi.rcWork;
-        int x = avoidRect.right + 14;
-        int y = avoidRect.top;
-        if (x + width > work.right) x = avoidRect.left - width - 14;
-        if (x < work.left) x = std::clamp(center.x - width / 2, work.left + 8, work.right - width - 8);
-        if (y + height > work.bottom) y = work.bottom - height - 8;
-        if (y < work.top) y = work.top + 8;
+        const RECT work = mi.rcWork;
+        const int minX = static_cast<int>(work.left) + workMargin;
+        const int maxX = std::max(minX, static_cast<int>(work.right) - width - workMargin);
+        const int minY = static_cast<int>(work.top) + workMargin;
+        const int maxY = std::max(minY, static_cast<int>(work.bottom) - height - workMargin);
+
+        int x = cursor.x - width / 2;
+        int y = cursor.y - height - cursorGap;
+
+        // 原則としてカーソルの真上へ表示する。上側に収まらない場合だけ下側へ退避する。
+        if (y < minY) {
+            y = cursor.y + cursorGap;
+        }
+
+        x = std::clamp(x, minX, maxX);
+        y = std::clamp(y, minY, maxY);
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
         ShowWindow(hwnd_, SW_SHOW);
         SetForegroundWindow(hwnd_);
@@ -3560,30 +3602,49 @@ private:
         extraPreviews_.clear();
     }
 
-    POINT PlaceGridAvoidingRect(const RECT& avoidRect, int gridW, int gridH) const {
-        POINT center{ (avoidRect.left + avoidRect.right) / 2, (avoidRect.top + avoidRect.bottom) / 2 };
-        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+    POINT PlaceGridBySetting(POINT cursorPoint, int gridW, int gridH) const {
+        HMONITOR mon = MonitorFromPoint(cursorPoint, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfoW(mon, &mi);
-        RECT work = mi.rcWork;
-        const int gap = 14;
-        std::vector<POINT> choices = {
-            { avoidRect.right + gap, avoidRect.top },
-            { avoidRect.left - gridW - gap, avoidRect.top },
-            { avoidRect.left, avoidRect.bottom + gap },
-            { avoidRect.left, avoidRect.top - gridH - gap }
-        };
-        for (POINT p : choices) {
-            RECT r{ p.x, p.y, p.x + gridW, p.y + gridH };
-            if (r.left >= work.left && r.top >= work.top && r.right <= work.right && r.bottom <= work.bottom && !IntersectRects(r, avoidRect)) return p;
+        const RECT work = mi.rcWork;
+        const int screenMargin = 8;
+        const int cursorGap = 16;
+        const int position = std::clamp(settings_.previewPositionIndex, 0, 4);
+
+        int x = cursorPoint.x + cursorGap;
+        int y = cursorPoint.y - gridH - cursorGap;
+        switch (position) {
+        case 0: // cursor upper-left
+            x = cursorPoint.x - gridW - cursorGap;
+            y = cursorPoint.y - gridH - cursorGap;
+            break;
+        case 1: // cursor upper-right
+            x = cursorPoint.x + cursorGap;
+            y = cursorPoint.y - gridH - cursorGap;
+            break;
+        case 2: // centered on cursor
+            x = cursorPoint.x - gridW / 2;
+            y = cursorPoint.y - gridH / 2;
+            break;
+        case 3: // cursor lower-left
+            x = cursorPoint.x - gridW - cursorGap;
+            y = cursorPoint.y + cursorGap;
+            break;
+        case 4: // cursor lower-right
+            x = cursorPoint.x + cursorGap;
+            y = cursorPoint.y + cursorGap;
+            break;
         }
-        const LONG minX = work.left + 8;
-        const LONG maxX = std::max<LONG>(minX, work.right - gridW - 8);
-        const LONG minY = work.top + 8;
-        const LONG maxY = std::max<LONG>(minY, work.bottom - gridH - 8);
-        POINT p{ std::clamp<LONG>(avoidRect.right + gap, minX, maxX),
-            std::clamp<LONG>(avoidRect.top, minY, maxY) };
-        return p;
+
+        const int minX = static_cast<int>(work.left) + screenMargin;
+        const int minY = static_cast<int>(work.top) + screenMargin;
+        const int maxX = std::max(minX, static_cast<int>(work.right) - gridW - screenMargin);
+        const int maxY = std::max(minY, static_cast<int>(work.bottom) - gridH - screenMargin);
+        POINT result{ std::clamp(x, minX, maxX), std::clamp(y, minY, maxY) };
+        Log(L"multi preview cursor-relative position applied: index=" + std::to_wstring(position) +
+            L" cursorX=" + std::to_wstring(cursorPoint.x) + L" cursorY=" + std::to_wstring(cursorPoint.y) +
+            L" x=" + std::to_wstring(result.x) + L" y=" + std::to_wstring(result.y));
+        return result;
     }
 
     static bool IntersectRects(const RECT& a, const RECT& b) {
@@ -3604,7 +3665,7 @@ private:
         const int cellH = preview_.WindowHeight();
         const int gridW = cols * cellW + (cols - 1) * gap;
         const int gridH = rows * cellH + (rows - 1) * gap;
-        POINT origin = PlaceGridAvoidingRect(avoidRect, gridW, gridH);
+        POINT origin = PlaceGridBySetting(latestMousePoint_, gridW, gridH);
 
         Log(L"multi preview layout: count=" + std::to_wstring(count) + L" cols=" + std::to_wstring(cols) + L" rows=" + std::to_wstring(rows));
         for (size_t i = 0; i < maxCount; ++i) {

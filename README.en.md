@@ -1,17 +1,22 @@
-# MvView v0.26
+# MvView v0.30
 
 [日本語](README.md)
 
 ![MvView previewing Explorer media](docs/images/MvView_Title.png)
 
+![Multiple-media preview](docs/images/MvView03.png)
+
+*Multiple-media preview*
+
 MvView is a resident C++/Win32 application that previews images, videos, and audio in a small libmpv-powered window when you hover over media items in Windows 11 Explorer.
 
-## What's new in v0.26
+## What's new in v0.30
 
-- Checks the latest GitHub Release once at startup
-- Shows an update dialog when a newer version is available; the **Download** button opens the latest release package
-- Provides separate Japanese and English README pages with language links
-- Adds a preview image near the title
+- Adds a **Preview position** setting
+- Lets you choose **Top-left**, **Top-right**, **Center**, **Bottom-left**, or **Bottom-right**
+- Applies the selected position to both single previews and multi-preview tile grids of up to nine items
+- Positions previews relative to the mouse cursor and only clamps them when they would extend beyond the current monitor's work area
+- Existing settings default to **Top-right**, which is closest to the previous behavior
 
 ## Highlights
 
@@ -19,7 +24,7 @@ MvView is a resident C++/Win32 application that previews images, videos, and aud
 - Resolves full paths safely by cross-checking UI Automation with the active Shell View
 - Previews images, video, and audio through libmpv
 - Confirms Ctrl/Shift multi-selection before showing up to nine tiled previews
-- Configurable hover delay, leave behavior, audio, resolution, border color, and pointer movement over the preview
+- Configurable hover delay, leave behavior, audio, resolution, border color, preview position, and pointer movement over the preview
 - Supports `--open` and generation-aware UTF-16 JSON `WM_COPYDATA` hover IPC
 - Notifies you when a newer GitHub Release is available
 
@@ -57,7 +62,7 @@ Settings are stored in:
 %APPDATA%\MvView\settings.json
 ```
 
-The tray Settings dialog includes hover enablement and delay (0–5000 ms), immediate close on leave, multi-selection confirmation, pointer movement over the preview, startup audio, resolution, and border color.
+The tray Settings dialog includes hover enablement and delay (0–5000 ms), immediate close on leave, multi-selection confirmation, pointer movement over the preview, startup audio, resolution, border color, and preview position.
 
 ## DirectOpen
 
@@ -76,6 +81,17 @@ DirectOpen uses `WM_COPYDATA` with `dwData == 1`. External hover clients use `dw
 Protocol `mvview-hover` version `1` supports `hover_open`, `hover_update`, `hover_move`, and `hover_close`. Requests include `source_pid`, `request_id`, and a monotonically increasing `generation`; stale requests are ignored.
 
 ## libmpv
+
+### Installation
+
+MvView requires a 64-bit libmpv runtime.
+
+1. Open the [official mpv installation page](https://mpv.io/installation/) and follow its link to the [shinchiro Windows builds](https://github.com/shinchiro/mpv-winbuild-cmake/releases/latest).
+2. From the latest release assets, download `mpv-dev-x86_64-...7z`. The `x86_64-v3` build targets newer CPUs; choose the regular `x86_64` build if you are unsure.
+3. Extract the archive with [7-Zip](https://www.7-zip.org/) or a compatible tool, then copy `mpv-2.dll` beside `MvView.exe`.
+4. Start `MvView.exe` and verify that a media preview opens.
+
+If the package provides `libmpv-2.dll` instead, keep that filename when copying it. Download DLLs only from a trusted distribution source, and do not use the 32-bit (`i686`) build.
 
 Runtime DLLs are searched in this order:
 
@@ -107,8 +123,8 @@ Output:
 
 ```text
 bin\x64\Release\MvView.exe
-publish\MvView_v0.26\
-publish\MvView_v0.26_YYYYMMDD_HHMMSS.zip
+publish\MvView_v0.30\
+publish\MvView_v0.30_YYYYMMDD_HHMMSS.zip
 ```
 
 ## Update check
@@ -129,6 +145,6 @@ After startup, MvView checks the latest release of `cyfomix-ui/MvView` once in t
 
 ## Versioning
 
-- Current version: `v0.26`
+- Current version: `v0.30`
 - `version.xml` is the single source of truth.
 - The same version is applied to the tray tooltip, About dialog, splash screen, executable resources, and package name.
